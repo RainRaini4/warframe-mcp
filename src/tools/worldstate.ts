@@ -3,6 +3,7 @@ import { z } from "zod";
 import * as ws from "../api/warframestat.js";
 import * as market from "../api/warframe-market.js";
 import * as fmt from "../utils/formatting.js";
+import { normalizeWorldstatePlatform, WORLDSTATE_PLATFORM_VALUES } from "../utils/platform.js";
 import type { Invasion, NightwaveChallenge } from "../types/index.js";
 
 export function registerWorldstateTools(server: McpServer): void {
@@ -12,10 +13,12 @@ export function registerWorldstateTools(server: McpServer): void {
     "Get current Warframe world state: sortie, archon hunt, nightwave, invasions, open world cycles, events, steel path, construction progress, and daily deals.",
     {
       platform: z
-        .enum(["pc", "ps4", "xb1", "swi"])
+        .enum(WORLDSTATE_PLATFORM_VALUES)
         .default("pc")
         .optional()
-        .describe("Game platform"),
+        .describe(
+          "Game platform. Canonical values: pc, ps4, xbox, switch. Legacy aliases accepted: xb1 → xbox, swi/ns → switch, psn → ps4. mobile is not supported by this upstream.",
+        ),
       sections: z
         .array(
           z.enum([
@@ -35,7 +38,7 @@ export function registerWorldstateTools(server: McpServer): void {
     },
     async (args) => {
       try {
-        const platform = args.platform ?? "pc";
+        const platform = normalizeWorldstatePlatform(args.platform ?? "pc");
         const allSections = [
           "cycles",
           "sortie",
@@ -328,10 +331,12 @@ export function registerWorldstateTools(server: McpServer): void {
     "Check Baro Ki'Teer's current status, inventory, and optional plat-per-ducat worth analysis.",
     {
       platform: z
-        .enum(["pc", "ps4", "xb1", "swi"])
+        .enum(WORLDSTATE_PLATFORM_VALUES)
         .default("pc")
         .optional()
-        .describe("Game platform"),
+        .describe(
+          "Game platform. Canonical values: pc, ps4, xbox, switch. Legacy aliases accepted: xb1 → xbox, swi/ns → switch, psn → ps4.",
+        ),
       show_worth_analysis: z
         .boolean()
         .default(true)
@@ -340,7 +345,7 @@ export function registerWorldstateTools(server: McpServer): void {
     },
     async (args) => {
       try {
-        const platform = args.platform ?? "pc";
+        const platform = normalizeWorldstatePlatform(args.platform ?? "pc");
         const showWorth = args.show_worth_analysis ?? true;
         const baro = await ws.getVoidTrader(platform);
         const active = fmt.isActive(baro.activation, baro.expiry);
@@ -432,10 +437,12 @@ export function registerWorldstateTools(server: McpServer): void {
     "List active Void Fissure missions, filterable by tier, Steel Path, Void Storm, and mission type.",
     {
       platform: z
-        .enum(["pc", "ps4", "xb1", "swi"])
+        .enum(WORLDSTATE_PLATFORM_VALUES)
         .default("pc")
         .optional()
-        .describe("Game platform"),
+        .describe(
+          "Game platform. Canonical values: pc, ps4, xbox, switch. Legacy aliases accepted: xb1 → xbox, swi/ns → switch, psn → ps4.",
+        ),
       tier: z
         .enum(["Lith", "Meso", "Neo", "Axi", "Requiem", "Omnia"])
         .optional()
@@ -455,7 +462,7 @@ export function registerWorldstateTools(server: McpServer): void {
     },
     async (args) => {
       try {
-        const platform = args.platform ?? "pc";
+        const platform = normalizeWorldstatePlatform(args.platform ?? "pc");
         let fissures = await ws.getFissures(platform);
 
         // Apply filters

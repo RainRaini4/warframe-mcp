@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import * as ws from "../api/warframestat.js";
+import { normalizeWorldstatePlatform, WORLDSTATE_PLATFORM_VALUES } from "../utils/platform.js";
 
 export function registerSimarisTools(server: McpServer): void {
   server.tool(
@@ -8,14 +9,16 @@ export function registerSimarisTools(server: McpServer): void {
     "Check today's Cephalon Simaris synthesis target and recommended scanning locations.",
     {
       platform: z
-        .enum(["pc", "ps4", "xb1", "swi"])
+        .enum(WORLDSTATE_PLATFORM_VALUES)
         .default("pc")
         .optional()
-        .describe("Game platform"),
+        .describe(
+          "Game platform. Canonical values: pc, ps4, xbox, switch. Legacy aliases accepted: xb1 → xbox, swi/ns → switch, psn → ps4.",
+        ),
     },
     async (args) => {
       try {
-        const platform = args.platform ?? "pc";
+        const platform = normalizeWorldstatePlatform(args.platform ?? "pc");
         const simaris = await ws.getSimaris(platform);
 
         if (!simaris.target || simaris.target === "") {

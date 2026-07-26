@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import * as market from "../api/warframe-market.js";
 import * as fmt from "../utils/formatting.js";
+import { MARKET_PLATFORM_VALUES, normalizeMarketPlatform } from "../utils/platform.js";
 
 function formatPriceCheck(
   result: Awaited<ReturnType<typeof market.priceCheck>>,
@@ -75,10 +76,12 @@ export function registerMarketTools(server: McpServer): void {
         .max(10)
         .describe("Item name(s) (e.g. ['Ash Prime Set', 'Serration'])"),
       platform: z
-        .enum(["pc", "ps4", "xbox", "switch"])
+        .enum(MARKET_PLATFORM_VALUES)
         .default("pc")
         .optional()
-        .describe("Trading platform"),
+        .describe(
+          "Trading platform. Canonical values: pc, ps4, xbox, switch, mobile. Legacy aliases accepted: xb1 → xbox, swi/ns → switch, psn → ps4.",
+        ),
       mod_rank: z
         .number()
         .int()
@@ -93,7 +96,7 @@ export function registerMarketTools(server: McpServer): void {
         .describe("Only show orders from online/in-game players"),
     },
     async (args) => {
-      const platform = args.platform ?? "pc";
+      const platform = normalizeMarketPlatform(args.platform ?? "pc");
       const onlineOnly = args.online_only ?? true;
       const results: string[] = [];
 

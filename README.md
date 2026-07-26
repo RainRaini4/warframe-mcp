@@ -109,6 +109,29 @@ The environment variables below apply only to the legacy Node HTTP entrypoint. N
 HOST=0.0.0.0 PORT=3000 ALLOWED_HOSTS=192.168.1.100,mypc.local npm run start:http
 ```
 
+### Platform identifiers
+
+Legacy tools accept the same canonical platform value regardless of the upstream they query. The MCP server normalizes the value internally, so callers never need to know that WarframeStatus uses `xb1`/`swi` while Warframe Market uses `xbox`/`switch`.
+
+| User value | Warframe Market | WarframeStatus |
+| ---------- | --------------- | -------------- |
+| `pc`       | `pc`            | `pc`           |
+| `ps4`      | `ps4`           | `ps4`          |
+| `xbox`     | `xbox`          | `xb1`          |
+| `switch`   | `switch`        | `swi`          |
+| `mobile`   | `mobile`        | not supported  |
+
+The following legacy aliases are accepted for backward compatibility and map to the canonical value:
+
+| Alias | Canonical |
+| ----- | --------- |
+| `xb1` | `xbox`    |
+| `swi` | `switch`  |
+| `ns`  | `switch`  |
+| `psn` | `ps4`     |
+
+`mobile` is only accepted by tools whose upstream exposes it (Warframe Market). Worldstate tools reject `mobile` with an error listing the accepted values. Unknown values are rejected by all tools; the error message enumerates the accepted canonical values and aliases.
+
 ## Cloudflare Deployment
 
 Check the bundle without publishing:

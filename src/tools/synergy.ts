@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import * as ws from "../api/warframestat.js";
+import { normalizeWorldstatePlatform, WORLDSTATE_PLATFORM_VALUES } from "../utils/platform.js";
 import type {
   Fissure,
   Invasion,
@@ -347,14 +348,16 @@ export function registerSynergyTools(server: McpServer): void {
     "Find the most efficient activity combos by cross-referencing active Nightwave challenges with current Fissures, Invasions, and Sortie. Tells you which single mission can complete multiple objectives at once.",
     {
       platform: z
-        .enum(["pc", "ps4", "xb1", "swi"])
+        .enum(WORLDSTATE_PLATFORM_VALUES)
         .default("pc")
         .optional()
-        .describe("Game platform"),
+        .describe(
+          "Game platform. Canonical values: pc, ps4, xbox, switch. Legacy aliases accepted: xb1 → xbox, swi/ns → switch, psn → ps4.",
+        ),
     },
     async (args) => {
       try {
-        const platform = args.platform ?? "pc";
+        const platform = normalizeWorldstatePlatform(args.platform ?? "pc");
 
         // Fetch all worldstate data in parallel
         const [nightwaveRes, fissureRes, invasionRes, sortieRes] =
