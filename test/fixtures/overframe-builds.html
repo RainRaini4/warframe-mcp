@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Overframe builds — synthetic fixture</title>
+</head>
+<body>
+<!--
+  Synthetic, anonymized fixture used only by the parser unit tests. It is not a
+  copy of the upstream page; it mirrors just enough of the structural anchors
+  the parser relies on (build-route links, h3 title, "guide by" author phrase,
+  vote dd, "Forma" counter) to exercise the parser deterministically.
+-->
+<div id="__next">
+  <main>
+    <h1>Top warframes builds</h1>
+
+    <article>
+      <a href="/build/100001/saryn-prime/spore-nuke/" class="BuildSummaryFull_buildCard">
+        <h3>Spore Nuke Endless</h3>
+      </a>
+      <p class="BuildSummaryFull_metadata">
+        guide by <span class="BuildSummaryFull_author">TesterOne</span>
+      </p>
+      <dl class="BuildSummaryFull_buildVotes">
+        <dt>Votes</dt><dd>42</dd>
+      </dl>
+      <p><span>3<!-- --> Forma</span></p>
+    </article>
+
+    <article>
+      <a href="/build/100002/saryn-prime/tankyer-meme/" class="BuildSummaryFull_buildCard">
+        <h3>Tank Saryn Meme Build</h3>
+      </a>
+      <p class="BuildSummaryFull_metadata">
+        guide by <span class="BuildSummaryFull_author">TesterTwo</span>
+      </p>
+      <dl class="BuildSummaryFull_buildVotes">
+        <dt>Votes</dt><dd>9</dd>
+      </dl>
+      <p><span>0<!-- --> Forma</span></p>
+    </article>
+
+    <!-- A duplicate of the first build id — must be de-duplicated. -->
+    <article>
+      <a href="/build/100001/saryn-prime/spore-nuke/" class="BuildSummaryFull_buildCard">
+        <h3>Spore Nuke Endless</h3>
+      </a>
+      <p class="BuildSummaryFull_metadata">
+        guide by <span class="BuildSummaryFull_author">TesterOne</span>
+      </p>
+      <dl class="BuildSummaryFull_buildVotes">
+        <dt>Votes</dt><dd>42</dd>
+      </dl>
+    </article>
+
+  </main>
+</div>
+
+<script id="__NEXT_DATA__" type="application/json">
+{"props":{"pageProps":{"itemBuilds":[{"id":100001}]}}}
+</script>
+</body>
+</html>

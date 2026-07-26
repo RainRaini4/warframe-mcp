@@ -1,7 +1,7 @@
-import { TTLCache, TTL } from "../utils/cache.js";
+import { TTLCache } from "../utils/cache.js";
 import type {
-  OverframeBuildSummary,
   OverframeBuildPageProps,
+  OverframeBuildSummary,
 } from "../types/index.js";
 
 const BASE_URL = "https://overframe.gg";
@@ -10,7 +10,9 @@ const cache = new TTLCache<unknown>();
 // Cache build pages for 6 hours (builds rarely change)
 const TTL_BUILDS = 6 * 60 * 60_000;
 
-/** Categories supported by Overframe build lists */
+/**
+ * Categories supported by Overframe build lists
+ */
 export type OverframeCategory =
   | "warframes"
   | "primary-weapons"
@@ -19,15 +21,41 @@ export type OverframeCategory =
   | "archwing"
   | "sentinels";
 
+// ─── Errors ─────────────────────────────────────────────────────────────────
+
+/**
+ * Raised when an Overframe page looks like a real build listing (it carries
+ * Overframe markers and build-route links) but the parser extracted zero
+ * builds. Almost always means upstream markup changed; the result is never
+ * cached so the next request re-attempts the parse.
+ */
+export class OverframeParseDriftError extends Error {
+  constructor(
+    public readonly category: OverframeCategory | "build",
+    public readonly path: string,
+  ) {
+    super(
+      `unexpected Overframe markup: parser returned 0 builds for ${path} (category=${category})`,
+    );
+    this.name = "OverframeParseDriftError";
+  }
+}
+
+// ─── HTML fetch (network boundary) ──────────────────────────────────────────
+
 /**
  * Fetch raw HTML from Overframe with a timeout.
  * Overframe public pages are allowed by robots.txt (only /api/ is disallowed).
  */
-async function fetchHTML(path: string, timeout = 15_000): Promise<string> {
+async function fetchHTML(
+  path: string,
+  fetcher: typeof fetch,
+  timeout = 15_000,
+): Promise<string> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeout);
   try {
-    const response = await fetch(`${BASE_URL}${path}`, {
+    const response = await fetcher(`${BASE_URL}${path}`, {
       headers: {
         Accept: "text/html",
         "User-Agent": "WarframeMCP/1.0 (build-lookup)",
@@ -41,80 +69,127 @@ async function fetchHTML(path: string, timeout = 15_000): Promise<string> {
   }
 }
 
+// ─── Pure parser (no network, no clock) ─────────────────────────────────────
+
+const NEXT_DATA_MARKER = '<script id="__NEXT_DATA__" type="application/json">';
+
 /**
- * Extract __NEXT_DATA__ JSON from an Overframe HTML page.
+ * Cheap structural check: does this HTML look like a real Overframe page that
+ * should contain builds? Used to separate "no results" from "markup changed".
  */
-function extractNextData(html: string): Record<string, unknown> | null {
-  const marker = '<script id="__NEXT_DATA__" type="application/json">';
-  const start = html.indexOf(marker);
-  if (start === -1) return null;
-  const jsonStart = start + marker.length;
-  const end = html.indexOf("</script>", jsonStart);
-  if (end === -1) return null;
-  try {
-    return JSON.parse(html.substring(jsonStart, end));
-  } catch {
-    return null;
-  }
+export function looksLikeOverframePage(html: string): boolean {
+  return html.includes(NEXT_DATA_MARKER) || html.includes("/build/");
 }
 
 /**
- * Parse build summaries from an Overframe build list HTML page.
- * Extracts data from BuildSummaryFull links.
+ * Build-route link: /build/{id}/{item-slug}/{title-slug}/
+ * The route itself is a stable structural anchor; we no longer require the
+ * surrounding CSS module class names, which change frequently upstream.
  */
-function parseBuildListHTML(html: string): OverframeBuildSummary[] {
+const BUILD_LINK_REGEX = /href="\/build\/(\d+)\/([a-z0-9-]+)\/([a-z0-9-]+)\/"/gi;
+
+/**
+ * Parse build summaries from an Overframe build list HTML page.
+ * Pure: takes a string, returns typed summaries, touches nothing else.
+ *
+ * Anchor strategy: each `/build/{id}/{item-slug}/{title-slug}/` route starts a
+ * build card. We scan a bounded window after each link for nearby title,
+ * author, vote, and forma text. When the text cannot be found, we fall back to
+ * slug-derived values so the caller always gets a usable summary.
+ */
+export function parseBuildListHTML(html: string): OverframeBuildSummary[] {
   const builds: OverframeBuildSummary[] = [];
-  // Match build summary links: /build/{id}/{item-slug}/{title-slug}/
-  const linkRegex =
-    /href="\/build\/(\d+)\/([^/]+)\/([^/]+)\/"[^>]*class="BuildSummaryFull_build[^"]*"/g;
   const seen = new Set<number>();
 
+  BUILD_LINK_REGEX.lastIndex = 0;
   let match: RegExpExecArray | null;
-  while ((match = linkRegex.exec(html)) !== null) {
+  while ((match = BUILD_LINK_REGEX.exec(html)) !== null) {
     const id = parseInt(match[1], 10);
-    if (seen.has(id)) continue;
+    if (!Number.isFinite(id) || seen.has(id)) continue;
     seen.add(id);
 
-    // Extract title from the h3 after this link
+    // Bounded window after the link for card-scoped text scraping.
     const afterLink = html.substring(match.index, match.index + 2000);
 
-    const titleMatch = afterLink.match(
-      /BuildSummaryFull_title[^"]*"[^>]*>([^<]+)</
-    );
-    const authorMatch = afterLink.match(
-      /BuildSummaryFull_blue[^"]*"[^>]*>[^<]+<\/span>[^]*?BuildSummaryFull_blue[^"]*"[^>]*>([^<]+)</
-    );
-    const votesMatch = afterLink.match(
-      /BuildSummaryFull_buildVotes[^]*?<dd>(\d+)<\/dd>/
-    );
-    const formaMatch = afterLink.match(/(\d+)<!-- --> Forma/);
-    const itemNameMatch = afterLink.match(
-      /BuildSummaryFull_blue[^"]*"[^>]*>([^<]+)<\/span>[^]*?guide by/
-    );
+    const title = extractNearbyTitle(afterLink) ?? match[3].replace(/-/g, " ");
+    const author = extractNearbyAuthor(afterLink) ?? "unknown";
+    const votes = extractNearbyVotes(afterLink);
+    const forma = extractNearbyForma(afterLink);
 
     builds.push({
       id,
       created: "",
       updated: "",
-      score: votesMatch ? parseInt(votesMatch[1], 10) : 0,
+      score: votes,
       url: `/build/${id}/${match[2]}/${match[3]}/`,
-      author: {
-        id: 0,
-        username: authorMatch ? authorMatch[1] : "unknown",
-        url: "",
-        is_staff: false,
-      },
-      formas: formaMatch ? parseInt(formaMatch[1], 10) : 0,
-      item_data: {
-        id: 0,
-        locTag: "",
-        texture_new: "",
-      },
-      title: titleMatch ? titleMatch[1] : match[3].replace(/-/g, " "),
+      author: { id: 0, username: author, url: "", is_staff: false },
+      formas: forma,
+      item_data: { id: 0, locTag: "", texture_new: "" },
+      title,
     });
   }
 
   return builds;
+}
+
+function extractNearbyTitle(window: string): string | null {
+  // h3 / heading text is the most stable title carrier; fall back to the first
+  // non-empty trimmed text node that does not look like metadata.
+  const heading = window.match(/<h3[^>]*>([^<]+)</i);
+  if (heading && heading[1].trim()) return decodeEntities(heading[1].trim());
+  return null;
+}
+
+function extractNearbyAuthor(window: string): string | null {
+  // "guide by <author>" is a stable Overframe phrasing. The author name is
+  // often wrapped in a span, so accept either a bare word or the first text
+  // node of the next element.
+  const guideByTag = window.match(/guide by\s*<[^>]*>([^<]+)/i);
+  if (guideByTag && guideByTag[1].trim()) return decodeEntities(guideByTag[1].trim());
+  const guideByBare = window.match(/guide by\s+([^<,\s]+)/i);
+  if (guideByBare && guideByBare[1].trim()) return decodeEntities(guideByBare[1].trim());
+  return null;
+}
+
+function extractNearbyVotes(window: string): number {
+  // Votes are typically rendered as a `<dd>N</dd>` near a "votes" label, or as
+  // a bare number followed by a votes icon. Accept either.
+  const dd = window.match(/(\d+)<\/dd>/i);
+  if (dd) return parseInt(dd[1], 10);
+  const icon = window.match(/(\d+)\s*(?:votes?|▲)/i);
+  return icon ? parseInt(icon[1], 10) : 0;
+}
+
+function extractNearbyForma(window: string): number {
+  const forma = window.match(/(\d+)<!--\s*-->\s*Forma/);
+  if (forma) return parseInt(forma[1], 10);
+  const formaAlt = window.match(/(\d+)\s*Forma/i);
+  return formaAlt ? parseInt(formaAlt[1], 10) : 0;
+}
+
+function decodeEntities(value: string): string {
+  return value
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
+}
+
+/**
+ * Extract __NEXT_DATA__ JSON from an Overframe HTML page. Pure.
+ */
+export function extractNextData(html: string): Record<string, unknown> | null {
+  const start = html.indexOf(NEXT_DATA_MARKER);
+  if (start === -1) return null;
+  const jsonStart = start + NEXT_DATA_MARKER.length;
+  const end = html.indexOf("</script>", jsonStart);
+  if (end === -1) return null;
+  try {
+    return JSON.parse(html.substring(jsonStart, end)) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -139,26 +214,48 @@ function normalizeToSlug(query: string): string {
     .replace(/^-|-$/g, "");
 }
 
-// ─── Public API ──────────────────────────────────────────────────────────────
+// ─── Public API ─────────────────────────────────────────────────────────────
 
 /**
  * Fetch top builds for a category, optionally filtered by item name.
  * Returns build summaries sorted by votes (highest first).
+ *
+ * Cache policy:
+ * - Successful non-empty result is cached.
+ * - Empty result on a page that looks like a real Overframe listing is treated
+ *   as parser drift and raises OverframeParseDriftError; it is never cached.
+ * - Network errors propagate and are never cached.
  */
 export async function getTopBuilds(
   category: OverframeCategory,
   itemName?: string,
-  limit = 5
+  limit = 5,
+  fetcher: typeof fetch = fetch,
 ): Promise<OverframeBuildSummary[]> {
   const cacheKey = `overframe:list:${category}`;
   let builds = cache.get(cacheKey) as OverframeBuildSummary[] | undefined;
 
   if (!builds) {
-    const html = await fetchHTML(`/builds/${category}/`);
-    builds = parseBuildListHTML(html);
-    // Sort by votes descending
-    builds.sort((a, b) => b.score - a.score);
-    cache.set(cacheKey, builds, TTL_BUILDS);
+    const path = `/builds/${category}/`;
+    const html = await fetchHTML(path, fetcher);
+    const parsed = parseBuildListHTML(html);
+
+    if (parsed.length === 0 && looksLikeOverframePage(html)) {
+      console.error(
+        `[overframe] parse drift: 0 builds extracted from ${path} (page looks like a real listing)`,
+      );
+      throw new OverframeParseDriftError(category, path);
+    }
+
+    // parsed.length === 0 without Overframe markers means the upstream returned
+    // something unexpected (404 page, empty body, ...). Do not cache it.
+    if (parsed.length === 0) {
+      throw new OverframeParseDriftError(category, path);
+    }
+
+    parsed.sort((a, b) => b.score - a.score);
+    cache.set(cacheKey, parsed, TTL_BUILDS);
+    builds = parsed;
   }
 
   if (itemName) {
@@ -175,23 +272,32 @@ export async function getTopBuilds(
 /**
  * Fetch full build details from a specific build page.
  * Returns the parsed __NEXT_DATA__ pageProps.
+ *
+ * Cache policy mirrors getTopBuilds: only successfully parsed pages are cached;
+ * malformed __NEXT_DATA__ raises and is not cached.
  */
 export async function getBuildDetail(
-  buildId: number
+  buildId: number,
+  fetcher: typeof fetch = fetch,
 ): Promise<OverframeBuildPageProps | null> {
   const cacheKey = `overframe:build:${buildId}`;
   const cached = cache.get(cacheKey) as OverframeBuildPageProps | undefined;
   if (cached) return cached;
 
-  const html = await fetchHTML(`/build/${buildId}/`);
+  const path = `/build/${buildId}/`;
+  const html = await fetchHTML(path, fetcher);
   const nextData = extractNextData(html);
-  if (!nextData) return null;
+  if (!nextData) {
+    throw new OverframeParseDriftError("build", path);
+  }
 
   const props = nextData as {
     props?: { pageProps?: OverframeBuildPageProps };
   };
   const pageProps = props?.props?.pageProps;
-  if (!pageProps?.data) return null;
+  if (!pageProps?.data) {
+    throw new OverframeParseDriftError("build", path);
+  }
 
   cache.set(cacheKey, pageProps, TTL_BUILDS);
   return pageProps;
@@ -220,4 +326,11 @@ export function inferCategory(
   if (t.includes("sentinel") || t.includes("companion"))
     return "sentinels";
   return null;
+}
+
+// ─── Test-only helpers ──────────────────────────────────────────────────────
+
+/** Test-only escape hatch to clear the in-memory Overframe cache. */
+export function clearOverframeCache(): void {
+  cache.clear();
 }
