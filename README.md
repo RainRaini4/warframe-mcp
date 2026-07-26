@@ -102,6 +102,7 @@ The environment variables below apply only to the legacy Node HTTP entrypoint. N
 | `PORT` | `3000` | HTTP listen port |
 | `HOST` | `127.0.0.1` | Bind address. Use `0.0.0.0` for LAN/container access |
 | `ALLOWED_HOSTS` | — | Comma-separated hostnames/IPs allowed through DNS rebinding protection (only needed when `HOST=0.0.0.0`) |
+| `MCP_SESSION_IDLE_TIMEOUT_MS` | `1800000` (30 minutes) | Idle timeout for legacy HTTP MCP sessions. Sessions older than this are closed and removed by a periodic sweep. Applies only to the legacy Node HTTP server; the Worker `/mcp` endpoint is stateless and stores no sessions. Values below `1000` or non-numeric values fall back to the default. |
 
 **Example — LAN-accessible server:**
 
