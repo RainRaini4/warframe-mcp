@@ -1,7 +1,12 @@
 {
-  "extends": "../tsconfig.json",
   "compilerOptions": {
-    "rootDir": "..",
+    "target": "ES2022",
+    "module": "Node16",
+    "moduleResolution": "Node16",
+    "lib": ["ES2022", "DOM"],
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
     "noEmit": true,
     "declaration": false,
     "declarationMap": false,
