@@ -9,15 +9,120 @@ import {
 const ITEM = {
   id: "item-titania",
   slug: "titania_prime",
+  maxRank: 5,
   i18n: {
     ru: { name: "Титания Прайм" },
     en: { name: "Titania Prime" },
   },
 };
 
+const LEGACY_STATISTICS = {
+  payload: {
+    statistics_closed: {
+      "48hours": [
+        {
+          datetime: "2026-07-26T08:00:00.000Z",
+          volume: 3,
+          min_price: 4,
+          max_price: 6,
+          open_price: 5,
+          closed_price: 6,
+          avg_price: 5,
+          wa_price: 5.5,
+          median: 5,
+          mod_rank: 0,
+        },
+        {
+          datetime: "2026-07-26T08:00:00.000Z",
+          volume: 1,
+          min_price: 100,
+          max_price: 100,
+          open_price: 100,
+          closed_price: 100,
+          avg_price: 100,
+          wa_price: 100,
+          median: 100,
+          mod_rank: 5,
+        },
+      ],
+      "90days": [
+        {
+          datetime: "2026-07-25T00:00:00.000Z",
+          volume: 9,
+          min_price: 90,
+          max_price: 110,
+          open_price: 95,
+          closed_price: 105,
+          avg_price: 100,
+          wa_price: 101,
+          median: 100,
+          mod_rank: 5,
+        },
+      ],
+    },
+    statistics_live: {
+      "48hours": [],
+      "90days": [],
+    },
+  },
+};
+
 const TOP_ORDERS = {
   sell: [],
   buy: [],
+};
+
+const FULL_ORDERS = [
+  {
+    id: "sell-online",
+    type: "sell",
+    platinum: 100,
+    quantity: 2,
+    visible: true,
+    rank: 5,
+    user: {
+      ingameName: "Seller",
+      status: "online",
+      reputation: 10,
+      platform: "pc",
+      crossplay: true,
+    },
+  },
+  {
+    id: "sell-offline",
+    type: "sell",
+    platinum: 95,
+    quantity: 1,
+    visible: true,
+    rank: 5,
+    user: {
+      ingameName: "OfflineSeller",
+      status: "offline",
+      reputation: 1,
+      platform: "pc",
+      crossplay: true,
+    },
+  },
+  {
+    id: "buy-online",
+    type: "buy",
+    platinum: 90,
+    quantity: 3,
+    visible: true,
+    rank: 5,
+    user: {
+      ingameName: "Buyer",
+      status: "ingame",
+      reputation: 20,
+      platform: "pc",
+      crossplay: true,
+    },
+  },
+];
+
+const RANK_FIVE_TOP_ORDERS = {
+  sell: [FULL_ORDERS[0]],
+  buy: [FULL_ORDERS[2]],
 };
 
 const noLimiter: MarketRequestLimiter = {
@@ -323,5 +428,362 @@ describe("Warframe Market request reliability", () => {
 
     await expect(client.searchItems("   ")).rejects.toMatchObject({ code: "validation" });
     expect(requests).toBe(0);
+  });
+});
+
+describe("Warframe Market legacy statistics", () => {
+  it("normalizes both ranges, keeps ranks separate, and applies exact rank filters", async () => {
+    const requests: string[] = [];
+    const client = new WarframeMarketClient({
+      limiter: noLimiter,
+      now: () => new Date("2026-07-26T10:00:00.000Z"),
+      fetcher: createFetch((input) => {
+        const url = typeof input === "string" ? input : input.toString();
+        requests.push(url);
+        if (url === "https://api.warframe.market/v2/items") return apiResponse([ITEM]);
+        if (url === "https://api.warframe.market/v1/items/titania_prime/statistics") {
+          return new Response(JSON.stringify(LEGACY_STATISTICS), {
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        throw new Error(`Unexpected request: ${url}`);
+      }),
+    });
+
+    const all = await client.getItemStatistics("titania_prime");
+    const rankFive = await client.getItemStatistics(
+      "titania_prime",
+      undefined,
+      { rank: 5 },
+    );
+
+    expect(all.status).toBe("available");
+    expect(all.variants.map((variant) => variant.variant)).toEqual([
+      { rank: 0 },
+      { rank: 5 },
+    ]);
+    expect(all.source).toMatchObject({ api: "warframe-market-v1", deprecated: true });
+    expect(all.warnings.join(" ")).toContain("deprecated");
+    expect(rankFive.variants).toHaveLength(1);
+    expect(rankFive.variants[0]?.variant).toEqual({ rank: 5 });
+    expect(rankFive.variants[0]?.closed.hours48).toHaveLength(1);
+    expect(rankFive.variants[0]?.closed.days90).toHaveLength(1);
+    expect(requests).toEqual([
+      "https://api.warframe.market/v2/items",
+      "https://api.warframe.market/v1/items/titania_prime/statistics",
+    ]);
+  });
+
+  it("returns an explicit empty result", async () => {
+    const client = new WarframeMarketClient({
+      limiter: noLimiter,
+      fetcher: createFetch((input) => {
+        const url = typeof input === "string" ? input : input.toString();
+        return url.endsWith("/v2/items")
+          ? apiResponse([ITEM])
+          : new Response(
+              JSON.stringify({
+                payload: {
+                  statistics_closed: { "48hours": [], "90days": [] },
+                },
+              }),
+              { headers: { "Content-Type": "application/json" } },
+            );
+      }),
+    });
+
+    const result = await client.getItemStatistics("titania_prime");
+
+    expect(result.status).toBe("empty");
+    expect(result.variants).toEqual([]);
+    expect(result.warnings.join(" ")).toContain("no closed-order buckets");
+  });
+
+  it("distinguishes an unknown slug before requesting legacy statistics", async () => {
+    const requests: string[] = [];
+    const client = new WarframeMarketClient({
+      limiter: noLimiter,
+      fetcher: createFetch((input) => {
+        const url = typeof input === "string" ? input : input.toString();
+        requests.push(url);
+        return apiResponse([]);
+      }),
+    });
+
+    await expect(client.getItemStatistics("missing_item")).rejects.toMatchObject({
+      code: "not_found",
+    });
+    expect(requests).toEqual(["https://api.warframe.market/v2/items"]);
+  });
+
+  it("distinguishes a removed legacy route from an unknown item", async () => {
+    const client = new WarframeMarketClient({
+      limiter: noLimiter,
+      fetcher: createFetch((input) => {
+        const url = typeof input === "string" ? input : input.toString();
+        return url.endsWith("/v2/items")
+          ? apiResponse([ITEM])
+          : new Response(JSON.stringify({ error: "missing" }), { status: 404 });
+      }),
+    });
+
+    await expect(client.getItemStatistics("titania_prime")).rejects.toMatchObject({
+      code: "statistics_unavailable",
+      message: expect.stringContaining("Текущие ордера остаются доступны"),
+    });
+  });
+
+  it("distinguishes malformed JSON", async () => {
+    const client = new WarframeMarketClient({
+      limiter: noLimiter,
+      fetcher: createFetch((input) => {
+        const url = typeof input === "string" ? input : input.toString();
+        return url.endsWith("/v2/items")
+          ? apiResponse([ITEM])
+          : new Response("{", { headers: { "Content-Type": "application/json" } });
+      }),
+    });
+
+    await expect(client.getItemStatistics("titania_prime")).rejects.toMatchObject({
+      code: "malformed_response",
+    });
+  });
+
+  it("retries 429 with Retry-After and transient 5xx responses", async () => {
+    let statisticsRequests = 0;
+    const delays: number[] = [];
+    const client = new WarframeMarketClient({
+      limiter: noLimiter,
+      retryBaseDelayMs: 1,
+      random: () => 1,
+      sleep: async (delayMs) => {
+        delays.push(delayMs);
+      },
+      fetcher: createFetch((input) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.endsWith("/v2/items")) return apiResponse([ITEM]);
+        statisticsRequests += 1;
+        if (statisticsRequests === 1) {
+          return new Response(null, { status: 429, headers: { "Retry-After": "2" } });
+        }
+        if (statisticsRequests === 2) return new Response(null, { status: 503 });
+        return new Response(JSON.stringify(LEGACY_STATISTICS));
+      }),
+    });
+
+    await client.getItemStatistics("titania_prime");
+
+    expect(statisticsRequests).toBe(3);
+    expect(delays).toEqual([2_000, 2]);
+  });
+
+  it("caches and deduplicates statistics independently of exact variant filtering", async () => {
+    let statisticsRequests = 0;
+    let resolveStatistics: ((response: Response) => void) | undefined;
+    const client = new WarframeMarketClient({
+      limiter: noLimiter,
+      fetcher: createFetch((input) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.endsWith("/v2/items")) return apiResponse([ITEM]);
+        statisticsRequests += 1;
+        return new Promise<Response>((resolve) => {
+          resolveStatistics = resolve;
+        });
+      }),
+    });
+
+    const rankZero = client.getItemStatistics("titania_prime", undefined, { rank: 0 });
+    const rankFive = client.getItemStatistics("titania_prime", undefined, { rank: 5 });
+    await vi.waitFor(() => expect(statisticsRequests).toBe(1));
+    resolveStatistics?.(new Response(JSON.stringify(LEGACY_STATISTICS)));
+
+    const [zeroResult, fiveResult] = await Promise.all([rankZero, rankFive]);
+    const cached = await client.getItemStatistics("titania_prime");
+
+    expect(statisticsRequests).toBe(1);
+    expect(zeroResult.variants[0]?.variant).toEqual({ rank: 0 });
+    expect(fiveResult.variants[0]?.variant).toEqual({ rank: 5 });
+    expect(cached.variants).toHaveLength(2);
+  });
+
+  it("refuses subtype aggregation when legacy statistics omit subtype", async () => {
+    const subtypeItem = {
+      ...ITEM,
+      subtypes: ["regular", "atragraph"],
+    };
+    const client = new WarframeMarketClient({
+      limiter: noLimiter,
+      fetcher: createFetch((input) => {
+        const url = typeof input === "string" ? input : input.toString();
+        return url.endsWith("/v2/items")
+          ? apiResponse([subtypeItem])
+          : new Response(JSON.stringify(LEGACY_STATISTICS));
+      }),
+    });
+
+    const result = await client.getItemStatistics("titania_prime");
+
+    expect(result.status).toBe("unsupported_variant_dimensions");
+    expect(result.variants).toEqual([]);
+    expect(result.warnings.join(" ")).toContain("subtype");
+  });
+});
+
+describe("Warframe Market liquidity", () => {
+  it("combines the full order snapshot, exact top orders, and exact-rank history", async () => {
+    const requests: string[] = [];
+    const client = new WarframeMarketClient({
+      limiter: noLimiter,
+      now: () => new Date("2026-07-26T10:00:00.000Z"),
+      fetcher: createFetch((input) => {
+        const url = typeof input === "string" ? input : input.toString();
+        requests.push(url);
+        if (url === "https://api.warframe.market/v2/items") return apiResponse([ITEM]);
+        if (url === "https://api.warframe.market/v2/orders/item/titania_prime") {
+          return apiResponse(FULL_ORDERS);
+        }
+        if (url === "https://api.warframe.market/v1/items/titania_prime/statistics") {
+          return new Response(JSON.stringify(LEGACY_STATISTICS));
+        }
+        if (
+          url === "https://api.warframe.market/v2/orders/item/titania_prime/top?rank=5"
+        ) {
+          return apiResponse(RANK_FIVE_TOP_ORDERS);
+        }
+        throw new Error(`Unexpected request: ${url}`);
+      }),
+    });
+
+    const result = await client.getItemLiquidity("titania_prime", undefined, { rank: 5 });
+
+    expect(result.filters.variant).toEqual({ rank: 5 });
+    expect(result.variants).toHaveLength(1);
+    expect(result.variants[0]).toMatchObject({
+      variant: { rank: 5 },
+      currentMarket: {
+        activeSellOrders: 2,
+        activeBuyOrders: 1,
+        onlineSellOrders: 1,
+        onlineBuyOrders: 1,
+        bestSell: 100,
+        bestBuy: 90,
+        sellDepthAtBestPrice: 2,
+        buyDepthAtBestPrice: 3,
+      },
+      history: {
+        reportedClosedVolume48h: 1,
+        reportedClosedVolume90d: 9,
+        averageDailyClosedVolume90d: 0.1,
+      },
+      assessment: {
+        score: expect.any(Number),
+        grade: expect.any(String),
+        confidence: "high",
+      },
+    });
+    expect(result.warnings.join(" ")).toContain("local heuristic");
+    expect(requests).toContain(
+      "https://api.warframe.market/v2/orders/item/titania_prime/top?rank=5",
+    );
+  });
+
+  it("degrades to current orders when deprecated history is unavailable", async () => {
+    const client = new WarframeMarketClient({
+      limiter: noLimiter,
+      maxRetries: 0,
+      fetcher: createFetch((input) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url === "https://api.warframe.market/v2/items") return apiResponse([ITEM]);
+        if (url === "https://api.warframe.market/v2/orders/item/titania_prime") {
+          return apiResponse(FULL_ORDERS);
+        }
+        if (url === "https://api.warframe.market/v1/items/titania_prime/statistics") {
+          return new Response(JSON.stringify({ error: "missing" }), { status: 404 });
+        }
+        if (
+          url === "https://api.warframe.market/v2/orders/item/titania_prime/top?rank=5"
+        ) {
+          return apiResponse(RANK_FIVE_TOP_ORDERS);
+        }
+        throw new Error(`Unexpected request: ${url}`);
+      }),
+    });
+
+    const result = await client.getItemLiquidity("titania_prime", undefined, { rank: 5 });
+
+    expect(result.variants[0]?.currentMarket).toMatchObject({ bestSell: 100, bestBuy: 90 });
+    expect(result.variants[0]?.history.averageDailyClosedVolume90d).toBeNull();
+    expect(result.variants[0]?.assessment).toMatchObject({
+      score: null,
+      grade: "unknown",
+      confidence: "low",
+    });
+    expect(result.variants[0]?.assessment.reasons).toContain("statistics_unavailable");
+    expect(result.warnings.join(" ")).toContain("Historical statistics were unavailable");
+  });
+
+  it("falls back to the full order snapshot when exact top orders fail", async () => {
+    const client = new WarframeMarketClient({
+      limiter: noLimiter,
+      maxRetries: 0,
+      fetcher: createFetch((input) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url === "https://api.warframe.market/v2/items") return apiResponse([ITEM]);
+        if (url === "https://api.warframe.market/v2/orders/item/titania_prime") {
+          return apiResponse(FULL_ORDERS);
+        }
+        if (url === "https://api.warframe.market/v1/items/titania_prime/statistics") {
+          return new Response(JSON.stringify(LEGACY_STATISTICS));
+        }
+        if (url.includes("/top?rank=5")) return apiResponse(null, 503);
+        throw new Error(`Unexpected request: ${url}`);
+      }),
+    });
+
+    const result = await client.getItemLiquidity("titania_prime", undefined, { rank: 5 });
+
+    expect(result.variants[0]?.currentMarket).toMatchObject({ bestSell: 100, bestBuy: 90 });
+    expect(result.warnings.join(" ")).toContain("Exact top orders were unavailable");
+  });
+
+  it("never uses a top order from a different rank", async () => {
+    const wrongRankTop = {
+      sell: [
+        {
+          ...FULL_ORDERS[0],
+          id: "wrong-rank-sell",
+          rank: 0,
+          platinum: 1,
+        },
+      ],
+      buy: [
+        {
+          ...FULL_ORDERS[2],
+          id: "wrong-rank-buy",
+          rank: 0,
+          platinum: 999,
+        },
+      ],
+    };
+    const client = new WarframeMarketClient({
+      limiter: noLimiter,
+      fetcher: createFetch((input) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url === "https://api.warframe.market/v2/items") return apiResponse([ITEM]);
+        if (url === "https://api.warframe.market/v2/orders/item/titania_prime") {
+          return apiResponse(FULL_ORDERS);
+        }
+        if (url === "https://api.warframe.market/v1/items/titania_prime/statistics") {
+          return new Response(JSON.stringify(LEGACY_STATISTICS));
+        }
+        if (url.includes("/top?rank=5")) return apiResponse(wrongRankTop);
+        throw new Error(`Unexpected request: ${url}`);
+      }),
+    });
+
+    const result = await client.getItemLiquidity("titania_prime", undefined, { rank: 5 });
+
+    expect(result.variants[0]?.currentMarket).toMatchObject({ bestSell: 100, bestBuy: 90 });
+    expect(result.warnings.join(" ")).toContain("did not preserve variant");
   });
 });

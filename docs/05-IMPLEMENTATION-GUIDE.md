@@ -220,19 +220,35 @@ URL patterns:
 
 ## `worker/warframe-market.ts`
 
-The production Worker uses a separate fetch-only client with no Node imports. It implements only:
+The production Worker uses a separate fetch-only client with no Node imports. It implements:
 
 - `GET /v2/items`, cached in the Worker isolate for six hours;
 - `GET /v2/orders/item/{slug}/top`, cached for 20 seconds;
+- `GET /v2/orders/item/{slug}`, cached for 20 seconds and used for visible/online counts plus best-price depth;
+- deprecated `GET /v1/items/{slug}/statistics`, cached for five minutes as optional closed-order history;
 - an 8-second `AbortController` timeout;
 - one shared sliding-window limiter with at most three external request starts per second;
 - retry for `429`, `509`, temporary `5xx`, and network errors, honoring `Retry-After` before bounded exponential backoff with jitter;
 - endpoint/filter-aware cache keys and in-flight promise deduplication;
 - specialized safe validation, HTTP, timeout, rate-limit, and availability errors.
 
-Every request sends `Accept`, `User-Agent`, `Language`, `Platform`, and `Crossplay`. `400`, `403`, `404`, validation failures, and timeouts are not retried. Rejected in-flight promises are removed so later calls can recover. There is intentionally no authorization, filesystem access, persistent storage, or order mutation method.
+Every request sends `Accept`, `User-Agent`, `Language`, `Platform`, and `Crossplay`. `400`, `403`, `404`, validation failures, and timeouts are not retried. Rejected in-flight promises are removed so later calls can recover. A known v2 catalog item with a legacy statistics `404` is classified as `statistics_unavailable`, not as an unknown item. There is intentionally no authorization, filesystem access, persistent storage, or order mutation method.
 
 Search normalization uses Unicode NFKD, lowercasing, `ё`→`е`, removal of combining marks and punctuation, separator normalization, and whitespace collapse. Matches are limited to exact or substring comparison.
+
+## `worker/market-analytics.ts`
+
+Statistics normalization and liquidity calculations are pure functions with no fetch, Worker, filesystem, or mutable global dependencies. The module:
+
+- maps legacy `mod_rank`, `amber_stars`, and `cyan_stars` fields into one `MarketVariantKey`;
+- keeps `rank`, `subtype`, `charges`, `amberStars`, and `cyanStars` combinations separate;
+- refuses history aggregation when a v2-declared variant dimension is missing from legacy buckets;
+- preserves missing numeric data as `null` and ignores unknown-field buckets with warnings;
+- summarizes reported volumes and prices separately for 48-hour and 90-day windows;
+- computes current visible/online counts, exact best prices, spread, and quantity depth at best price;
+- computes the documented deterministic 0–100 heuristic only when usable 90-day history exists.
+
+`getItemLiquidity` treats full current orders as required. Legacy history and exact variant `/top` calls degrade independently: unavailable history yields current metrics with `score=null`, while unavailable `/top` prices fall back to the full current-order snapshot. All fallbacks are surfaced in `warnings`.
 
 ## `src/api/warframe-market.ts` (legacy Node)
 

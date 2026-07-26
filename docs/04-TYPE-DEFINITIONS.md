@@ -2,7 +2,7 @@
 
 Copy these verbatim into `src/types/`. Do not modify field names — they match API JSON keys exactly.
 
-The production Worker keeps its smaller public market types in `worker/warframe-market.ts` and its OpenAI compatibility types in `worker/openai-compat.ts`. Its MCP shapes are:
+The production Worker keeps API-facing market types in `worker/warframe-market.ts`, pure statistics/liquidity types in `worker/market-analytics.ts`, and OpenAI compatibility types in `worker/openai-compat.ts`. Its core MCP shapes are:
 
 ```typescript
 interface MarketFilters {
@@ -34,13 +34,114 @@ interface TopOrdersResult {
   retrieved_at: string;
 }
 
+interface MarketVariantKey {
+  rank?: number;
+  subtype?: string;
+  charges?: number;
+  amberStars?: number;
+  cyanStars?: number;
+}
+
+type MarketHistoryStatus = "available" | "empty" | "unsupported_variant_dimensions";
+
+interface MarketStatisticsSummary {
+  reportedClosedVolume: number;
+  bucketCount: number;
+  bucketsWithVolume: number;
+  averageVolumePerBucket: number | null;
+  latestMedianPrice: number | null;
+  weightedMedianPrice: number | null;
+  weightedAveragePrice: number | null;
+  firstTimestamp: string | null;
+  lastTimestamp: string | null;
+}
+
+interface MarketStatisticPoint {
+  datetime: string;
+  volume: number | null;
+  minPrice: number | null;
+  maxPrice: number | null;
+  averagePrice: number | null;
+  weightedAveragePrice: number | null;
+  medianPrice: number | null;
+  openPrice: number | null;
+  closePrice: number | null;
+  variant: MarketVariantKey;
+}
+
+interface MarketStatisticsVariantResult {
+  variant: MarketVariantKey;
+  closed: {
+    hours48: MarketStatisticPoint[];
+    days90: MarketStatisticPoint[];
+  };
+  summaries: {
+    hours48: MarketStatisticsSummary | null;
+    days90: MarketStatisticsSummary | null;
+  };
+}
+
+interface ItemStatisticsResult {
+  item: { slug: string; url: string };
+  filters: { platform: MarketPlatform; crossplay: boolean; variant?: MarketVariantKey };
+  status: MarketHistoryStatus;
+  variants: MarketStatisticsVariantResult[];
+  source: {
+    api: "warframe-market-v1";
+    deprecated: true;
+    description: string;
+  };
+  retrievedAt: string;
+  warnings: string[];
+}
+
+interface LiquidityVariantResult {
+  variant: MarketVariantKey;
+  currentMarket: {
+    activeSellOrders: number;
+    activeBuyOrders: number;
+    onlineSellOrders: number;
+    onlineBuyOrders: number;
+    bestSell: number | null;
+    bestBuy: number | null;
+    midpoint: number | null;
+    absoluteSpread: number | null;
+    spreadPercent: number | null;
+    sellDepthAtBestPrice: number;
+    buyDepthAtBestPrice: number;
+  };
+  history: {
+    reportedClosedVolume48h: number | null;
+    reportedClosedVolume90d: number | null;
+    averageDailyClosedVolume90d: number | null;
+    latestMedianPrice48h: number | null;
+    weightedAveragePrice48h: number | null;
+  };
+  assessment: {
+    score: number | null;
+    grade: "very_high" | "high" | "medium" | "low" | "very_low" | "unknown";
+    confidence: "high" | "medium" | "low";
+    reasons: string[];
+  };
+}
+
+interface ItemLiquidityResult {
+  item: { slug: string; url: string };
+  filters: { platform: MarketPlatform; crossplay: boolean; variant?: MarketVariantKey };
+  variants: LiquidityVariantResult[];
+  retrievedAt: string;
+  warnings: string[];
+}
+
 type WarframeMarketErrorCode =
   | "validation"
   | "not_found"
   | "forbidden"
   | "timeout"
   | "rate_limited"
-  | "unavailable";
+  | "unavailable"
+  | "malformed_response"
+  | "statistics_unavailable";
 
 interface OpenAiSearchOutput {
   results: Array<{

@@ -1,4 +1,21 @@
+import {
+  buildLiquidityVariants,
+  collectLiquidityVariants,
+  type MarketHistoryStatus,
+  type MarketItemVariantCapabilities,
+  type MarketVariantTopOrders,
+  type MarketStatisticsVariantResult,
+  type MarketVariantKey,
+  type LiquidityMarketOrder,
+  type LiquidityVariantResult,
+  marketVariantFromOrder,
+  marketVariantKey,
+  normalizeLegacyStatistics,
+  normalizeMarketVariant,
+} from "./market-analytics.js";
+
 export const WFM_API_BASE_URL = "https://api.warframe.market/v2";
+export const WFM_LEGACY_API_BASE_URL = "https://api.warframe.market/v1";
 export const WFM_ITEM_BASE_URL = "https://warframe.market/items/";
 
 export const MARKET_LANGUAGES = [
@@ -52,13 +69,77 @@ export interface MarketOrderUser {
 
 export interface MarketTopOrder {
   id: string;
+  type?: "sell" | "buy";
   platinum: number;
   quantity: number;
   per_trade?: number;
   rank?: number;
   subtype?: string;
+  charges?: number;
+  amberStars?: number;
+  cyanStars?: number;
+  visible?: boolean;
+  created_at?: string;
   updated_at?: string;
   user: MarketOrderUser;
+}
+
+export interface MarketOrder extends MarketTopOrder {
+  type: "sell" | "buy";
+  visible: boolean;
+  created_at?: string;
+}
+
+export interface MarketItemDescriptor {
+  id: string;
+  slug: string;
+  capabilities: MarketItemVariantCapabilities;
+}
+
+export interface ItemStatisticsResult {
+  item: {
+    slug: string;
+    url: string;
+  };
+  filters: {
+    platform: MarketPlatform;
+    crossplay: boolean;
+    variant?: MarketVariantKey;
+  };
+  status: MarketHistoryStatus;
+  variants: MarketStatisticsVariantResult[];
+  source: {
+    api: "warframe-market-v1";
+    deprecated: true;
+    description: string;
+  };
+  retrievedAt: string;
+  warnings: string[];
+}
+
+export interface OrdersResult {
+  item: {
+    slug: string;
+    url: string;
+  };
+  orders: MarketOrder[];
+  filters: MarketFilters;
+  retrieved_at: string;
+}
+
+export interface ItemLiquidityResult {
+  item: {
+    slug: string;
+    url: string;
+  };
+  filters: {
+    platform: MarketPlatform;
+    crossplay: boolean;
+    variant?: MarketVariantKey;
+  };
+  variants: LiquidityVariantResult[];
+  retrievedAt: string;
+  warnings: string[];
 }
 
 export interface SearchItemsResult {
@@ -85,7 +166,9 @@ export type WarframeMarketErrorCode =
   | "forbidden"
   | "timeout"
   | "rate_limited"
-  | "unavailable";
+  | "unavailable"
+  | "malformed_response"
+  | "statistics_unavailable";
 
 export class WarframeMarketError extends Error {
   constructor(
@@ -139,6 +222,20 @@ export class WarframeMarketUnavailableError extends WarframeMarketError {
   }
 }
 
+export class WarframeMarketMalformedResponseError extends WarframeMarketError {
+  constructor(message: string) {
+    super("malformed_response", message);
+    this.name = "WarframeMarketMalformedResponseError";
+  }
+}
+
+export class WarframeMarketStatisticsUnavailableError extends WarframeMarketError {
+  constructor(message: string) {
+    super("statistics_unavailable", message);
+    this.name = "WarframeMarketStatisticsUnavailableError";
+  }
+}
+
 interface ApiEnvelope<T> {
   data?: T | null;
   error?: unknown;
@@ -152,6 +249,11 @@ interface ApiItem {
   id?: unknown;
   slug?: unknown;
   i18n?: Record<string, ApiItemI18n | undefined>;
+  maxRank?: unknown;
+  subtypes?: unknown;
+  maxCharges?: unknown;
+  maxAmberStars?: unknown;
+  maxCyanStars?: unknown;
 }
 
 interface CachedValue<T> {
@@ -161,6 +263,11 @@ interface CachedValue<T> {
 
 interface RequestResult<T> {
   data: T;
+  retrievedAt: string;
+}
+
+interface JsonRequestResult<T> {
+  body: T;
   retrievedAt: string;
 }
 
@@ -228,13 +335,16 @@ export interface WarframeMarketClientOptions {
   baseUrl?: string;
   fetcher?: typeof fetch;
   itemsCacheTtlMs?: number;
+  legacyBaseUrl?: string;
   limiter?: MarketRequestLimiter;
   maxRetries?: number;
   now?: () => Date;
+  ordersCacheTtlMs?: number;
   random?: () => number;
   retryBaseDelayMs?: number;
   retryMaxDelayMs?: number;
   sleep?: (delayMs: number) => Promise<void>;
+  statisticsCacheTtlMs?: number;
   timeoutMs?: number;
   topOrdersCacheTtlMs?: number;
   userAgent?: string;
@@ -243,10 +353,14 @@ export interface WarframeMarketClientOptions {
 const DEFAULT_TIMEOUT_MS = 8_000;
 const DEFAULT_ITEMS_CACHE_TTL_MS = 6 * 60 * 60_000;
 const DEFAULT_TOP_ORDERS_CACHE_TTL_MS = 20_000;
+const DEFAULT_ORDERS_CACHE_TTL_MS = 20_000;
+export const DEFAULT_STATISTICS_CACHE_TTL_MS = 5 * 60_000;
 const DEFAULT_MAX_RETRIES = 2;
 const DEFAULT_RETRY_BASE_DELAY_MS = 250;
 const DEFAULT_RETRY_MAX_DELAY_MS = 2_000;
 const DEFAULT_USER_AGENT = "warframe-mcp/1.0.0 (Cloudflare Workers; read-only)";
+const LEGACY_STATISTICS_SOURCE_DESCRIPTION =
+  "Deprecated and unsupported Warframe Market v1 closed-order statistics. Reported volume is not a complete or independently verified record of in-game trades.";
 const RETRYABLE_HTTP_STATUSES = new Set([429, 500, 502, 503, 504, 509]);
 const responseCache = new Map<string, CachedValue<unknown>>();
 const inFlightRequests = new Map<string, Promise<unknown>>();
@@ -442,24 +556,145 @@ function toTopOrder(value: unknown): MarketTopOrder | undefined {
   };
 
   if (typeof value.perTrade === "number") order.per_trade = value.perTrade;
+  if (value.type === "sell" || value.type === "buy") order.type = value.type;
   if (typeof value.rank === "number") order.rank = value.rank;
   if (typeof value.subtype === "string") order.subtype = value.subtype;
+  if (typeof value.charges === "number") order.charges = value.charges;
+  if (typeof value.amberStars === "number") order.amberStars = value.amberStars;
+  if (typeof value.cyanStars === "number") order.cyanStars = value.cyanStars;
+  if (typeof value.visible === "boolean") order.visible = value.visible;
+  if (typeof value.createdAt === "string") order.created_at = value.createdAt;
   if (typeof value.updatedAt === "string") order.updated_at = value.updatedAt;
 
   return order;
+}
+
+function toMarketOrder(value: unknown): MarketOrder | undefined {
+  const order = toTopOrder(value);
+  if (!order || (order.type !== "sell" && order.type !== "buy")) return undefined;
+  if (order.visible === undefined) return undefined;
+  return order as MarketOrder;
+}
+
+function toLiquidityOrder(
+  order: MarketTopOrder,
+  type: "sell" | "buy",
+): LiquidityMarketOrder {
+  return {
+    id: order.id,
+    type,
+    platinum: order.platinum,
+    quantity: order.quantity,
+    visible: order.visible ?? true,
+    ...(order.rank !== undefined ? { rank: order.rank } : {}),
+    ...(order.subtype !== undefined ? { subtype: order.subtype } : {}),
+    ...(order.charges !== undefined ? { charges: order.charges } : {}),
+    ...(order.amberStars !== undefined ? { amberStars: order.amberStars } : {}),
+    ...(order.cyanStars !== undefined ? { cyanStars: order.cyanStars } : {}),
+    user: { status: order.user.status },
+  };
+}
+
+function variantQuery(variant?: MarketVariantKey): string {
+  if (!variant) return "";
+  const params = new URLSearchParams();
+  if (variant.rank !== undefined) params.set("rank", String(variant.rank));
+  if (variant.subtype !== undefined) params.set("subtype", variant.subtype);
+  if (variant.charges !== undefined) params.set("charges", String(variant.charges));
+  if (variant.amberStars !== undefined) {
+    params.set("amberStars", String(variant.amberStars));
+  }
+  if (variant.cyanStars !== undefined) {
+    params.set("cyanStars", String(variant.cyanStars));
+  }
+  const query = params.toString();
+  return query ? `?${query}` : "";
+}
+
+function optionalNonNegativeInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0
+    ? value
+    : undefined;
+}
+
+function toItemDescriptor(item: ApiItem): MarketItemDescriptor | undefined {
+  if (typeof item.id !== "string" || typeof item.slug !== "string") return undefined;
+
+  const capabilities: MarketItemVariantCapabilities = {};
+  const maxRank = optionalNonNegativeInteger(item.maxRank);
+  const maxCharges = optionalNonNegativeInteger(item.maxCharges);
+  const maxAmberStars = optionalNonNegativeInteger(item.maxAmberStars);
+  const maxCyanStars = optionalNonNegativeInteger(item.maxCyanStars);
+  const subtypes = Array.isArray(item.subtypes)
+    ? item.subtypes.filter(
+        (value): value is string => typeof value === "string" && value.trim().length > 0,
+      )
+    : [];
+
+  if (maxRank !== undefined) capabilities.maxRank = maxRank;
+  if (subtypes.length > 0) capabilities.subtypes = subtypes;
+  if (maxCharges !== undefined) capabilities.maxCharges = maxCharges;
+  if (maxAmberStars !== undefined) capabilities.maxAmberStars = maxAmberStars;
+  if (maxCyanStars !== undefined) capabilities.maxCyanStars = maxCyanStars;
+
+  return { id: item.id, slug: item.slug, capabilities };
+}
+
+function validateVariantFilter(
+  variant: MarketVariantKey | undefined,
+  capabilities: MarketItemVariantCapabilities,
+): MarketVariantKey | undefined {
+  if (!variant) return undefined;
+  const normalized = normalizeMarketVariant(variant);
+
+  const validateBoundedField = (
+    field: "rank" | "charges" | "amberStars" | "cyanStars",
+    maximum: number | undefined,
+  ) => {
+    const value = normalized[field];
+    if (value === undefined) return;
+    if (maximum === undefined) {
+      throw new WarframeMarketValidationError(
+        `Предмет не поддерживает variant-поле ${field}.`,
+      );
+    }
+    if (!Number.isInteger(value) || value < 0 || value > maximum) {
+      throw new WarframeMarketValidationError(
+        `Значение ${field} должно быть целым числом от 0 до ${maximum}.`,
+      );
+    }
+  };
+
+  validateBoundedField("rank", capabilities.maxRank);
+  validateBoundedField("charges", capabilities.maxCharges);
+  validateBoundedField("amberStars", capabilities.maxAmberStars);
+  validateBoundedField("cyanStars", capabilities.maxCyanStars);
+
+  if (normalized.subtype !== undefined) {
+    if (!capabilities.subtypes?.includes(normalized.subtype)) {
+      throw new WarframeMarketValidationError(
+        `Предмет не поддерживает subtype "${normalized.subtype}".`,
+      );
+    }
+  }
+
+  return normalized;
 }
 
 export class WarframeMarketClient {
   private readonly baseUrl: string;
   private readonly fetcher: typeof fetch;
   private readonly itemsCacheTtlMs: number;
+  private readonly legacyBaseUrl: string;
   private readonly limiter: MarketRequestLimiter;
   private readonly maxRetries: number;
   private readonly now: () => Date;
+  private readonly ordersCacheTtlMs: number;
   private readonly random: () => number;
   private readonly retryBaseDelayMs: number;
   private readonly retryMaxDelayMs: number;
   private readonly sleep: (delayMs: number) => Promise<void>;
+  private readonly statisticsCacheTtlMs: number;
   private readonly timeoutMs: number;
   private readonly topOrdersCacheTtlMs: number;
   private readonly userAgent: string;
@@ -468,13 +703,17 @@ export class WarframeMarketClient {
     this.baseUrl = options.baseUrl ?? WFM_API_BASE_URL;
     this.fetcher = options.fetcher ?? ((input, init) => fetch(input, init));
     this.itemsCacheTtlMs = options.itemsCacheTtlMs ?? DEFAULT_ITEMS_CACHE_TTL_MS;
+    this.legacyBaseUrl = options.legacyBaseUrl ?? WFM_LEGACY_API_BASE_URL;
     this.limiter = options.limiter ?? sharedRateLimiter;
     this.maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
     this.now = options.now ?? (() => new Date());
+    this.ordersCacheTtlMs = options.ordersCacheTtlMs ?? DEFAULT_ORDERS_CACHE_TTL_MS;
     this.random = options.random ?? Math.random;
     this.retryBaseDelayMs = options.retryBaseDelayMs ?? DEFAULT_RETRY_BASE_DELAY_MS;
     this.retryMaxDelayMs = options.retryMaxDelayMs ?? DEFAULT_RETRY_MAX_DELAY_MS;
     this.sleep = options.sleep ?? wait;
+    this.statisticsCacheTtlMs =
+      options.statisticsCacheTtlMs ?? DEFAULT_STATISTICS_CACHE_TTL_MS;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.topOrdersCacheTtlMs =
       options.topOrdersCacheTtlMs ?? DEFAULT_TOP_ORDERS_CACHE_TTL_MS;
@@ -526,6 +765,7 @@ export class WarframeMarketClient {
   async getTopOrders(
     slug: string,
     filterOverrides?: Partial<MarketFilters>,
+    variantFilter?: MarketVariantKey,
   ): Promise<TopOrdersResult> {
     const normalizedSlug = slug.trim();
     if (!normalizedSlug) {
@@ -533,7 +773,7 @@ export class WarframeMarketClient {
     }
 
     const filters = resolveFilters(filterOverrides);
-    const path = `/orders/item/${encodeURIComponent(normalizedSlug)}/top`;
+    const path = `/orders/item/${encodeURIComponent(normalizedSlug)}/top${variantQuery(variantFilter)}`;
     return loadCached(
       cacheKey(this.baseUrl, path, filters),
       this.topOrdersCacheTtlMs,
@@ -580,6 +820,265 @@ export class WarframeMarketClient {
     );
   }
 
+  async getOrders(
+    slug: string,
+    filterOverrides?: Partial<MarketFilters>,
+  ): Promise<OrdersResult> {
+    const normalizedSlug = slug.trim();
+    if (!normalizedSlug) {
+      throw new WarframeMarketValidationError("Slug предмета не должен быть пустым.");
+    }
+
+    const filters = resolveFilters(filterOverrides);
+    const path = `/orders/item/${encodeURIComponent(normalizedSlug)}`;
+    return loadCached(
+      cacheKey(this.baseUrl, path, filters),
+      this.ordersCacheTtlMs,
+      () => this.now().getTime(),
+      async () => {
+        const result = await this.request<unknown>(path, filters, normalizedSlug);
+        if (!Array.isArray(result.data)) {
+          throw new WarframeMarketMalformedResponseError(
+            "Warframe Market API вернул некорректный формат полного списка ордеров.",
+          );
+        }
+
+        const orders = result.data
+          .map(toMarketOrder)
+          .filter((order): order is MarketOrder => order !== undefined)
+          .sort((left, right) => left.id.localeCompare(right.id));
+
+        return {
+          item: {
+            slug: normalizedSlug,
+            url: itemUrl(normalizedSlug),
+          },
+          orders,
+          filters,
+          retrieved_at: result.retrievedAt,
+        };
+      },
+    );
+  }
+
+  async getItemDescriptor(
+    slug: string,
+    filterOverrides?: Partial<MarketFilters>,
+  ): Promise<MarketItemDescriptor> {
+    const normalizedSlug = slug.trim();
+    if (!normalizedSlug) {
+      throw new WarframeMarketValidationError("Slug предмета не должен быть пустым.");
+    }
+
+    const filters = resolveFilters(filterOverrides);
+    const items = await this.getItems(filters);
+    const descriptor = items.items
+      .map(toItemDescriptor)
+      .find((item) => item?.slug === normalizedSlug);
+    if (!descriptor) {
+      throw new WarframeMarketNotFoundError(
+        `Предмет "${normalizedSlug}" не найден в Warframe Market.`,
+      );
+    }
+    return descriptor;
+  }
+
+  async getItemStatistics(
+    slug: string,
+    filterOverrides?: Partial<MarketFilters>,
+    variantFilter?: MarketVariantKey,
+  ): Promise<ItemStatisticsResult> {
+    const normalizedSlug = slug.trim();
+    if (!normalizedSlug) {
+      throw new WarframeMarketValidationError("Slug предмета не должен быть пустым.");
+    }
+
+    const filters = resolveFilters(filterOverrides);
+    const item = await this.getItemDescriptor(normalizedSlug, filters);
+    const variant = validateVariantFilter(variantFilter, item.capabilities);
+    const path = `/items/${encodeURIComponent(normalizedSlug)}/statistics`;
+
+    const statistics = await loadCached(
+      cacheKey(this.legacyBaseUrl, path, filters),
+      this.statisticsCacheTtlMs,
+      () => this.now().getTime(),
+      async () => {
+        let result: JsonRequestResult<unknown>;
+        try {
+          result = await this.requestJson<unknown>(
+            this.legacyBaseUrl,
+            path,
+            filters,
+            normalizedSlug,
+          );
+        } catch (error) {
+          if (error instanceof WarframeMarketNotFoundError) {
+            throw new WarframeMarketStatisticsUnavailableError(
+              "Legacy statistics endpoint не вернул данные для существующего предмета. Текущие ордера остаются доступны.",
+            );
+          }
+          throw error;
+        }
+
+        if (!isRecord(result.body) || !isRecord(result.body.payload)) {
+          throw new WarframeMarketMalformedResponseError(
+            "Legacy statistics endpoint вернул некорректный JSON-контракт.",
+          );
+        }
+
+        const closed = result.body.payload.statistics_closed;
+        if (!isRecord(closed)) {
+          throw new WarframeMarketMalformedResponseError(
+            "Legacy statistics endpoint не вернул payload.statistics_closed.",
+          );
+        }
+
+        const hours48 = closed["48hours"];
+        const days90 = closed["90days"];
+        if (!Array.isArray(hours48) || !Array.isArray(days90)) {
+          throw new WarframeMarketMalformedResponseError(
+            "Legacy statistics endpoint не вернул диапазоны 48hours и 90days.",
+          );
+        }
+
+        return { hours48, days90, retrievedAt: result.retrievedAt };
+      },
+    );
+    const normalized = normalizeLegacyStatistics(
+      statistics.hours48,
+      statistics.days90,
+      item.capabilities,
+      variant,
+    );
+
+    return {
+      item: {
+        slug: normalizedSlug,
+        url: itemUrl(normalizedSlug),
+      },
+      filters: {
+        platform: filters.platform,
+        crossplay: filters.crossplay,
+        ...(variant ? { variant } : {}),
+      },
+      status: normalized.status,
+      variants: normalized.variants,
+      source: {
+        api: "warframe-market-v1",
+        deprecated: true,
+        description: LEGACY_STATISTICS_SOURCE_DESCRIPTION,
+      },
+      retrievedAt: statistics.retrievedAt,
+      warnings: [
+        "Legacy v1 statistics are deprecated and may become unavailable without notice.",
+        "reportedClosedVolume is the volume reported by Warframe Market, not a complete or independently verified count of in-game trades.",
+        ...normalized.warnings,
+      ],
+    };
+  }
+
+  async getItemLiquidity(
+    slug: string,
+    filterOverrides?: Partial<MarketFilters>,
+    variantFilter?: MarketVariantKey,
+  ): Promise<ItemLiquidityResult> {
+    const normalizedSlug = slug.trim();
+    if (!normalizedSlug) {
+      throw new WarframeMarketValidationError("Slug предмета не должен быть пустым.");
+    }
+
+    const filters = resolveFilters(filterOverrides);
+    const item = await this.getItemDescriptor(normalizedSlug, filters);
+    const variant = validateVariantFilter(variantFilter, item.capabilities);
+    const warnings = [
+      "Liquidity is a local heuristic derived from a current public-order snapshot and deprecated v1 closed-order statistics; it is not a guarantee of execution or profit.",
+      "Current order counts include visible listings; online counts include users with online or ingame status.",
+    ];
+
+    const [orders, statisticsOutcome] = await Promise.all([
+      this.getOrders(normalizedSlug, filters),
+      this.getItemStatistics(normalizedSlug, filters, variant)
+        .then((statistics) => ({ ok: true as const, statistics }))
+        .catch((error: unknown) => ({ ok: false as const, error })),
+    ]);
+
+    let historyStatus: MarketHistoryStatus | "unavailable" = "unavailable";
+    let historyUnavailableReason: string | undefined = "statistics_unavailable";
+    let statisticsVariants: MarketStatisticsVariantResult[] = [];
+    let statisticsRetrievedAt: string | undefined;
+
+    if (statisticsOutcome.ok) {
+      historyStatus = statisticsOutcome.statistics.status;
+      historyUnavailableReason = undefined;
+      statisticsVariants = statisticsOutcome.statistics.variants;
+      statisticsRetrievedAt = statisticsOutcome.statistics.retrievedAt;
+      warnings.push(...statisticsOutcome.statistics.warnings);
+    } else {
+      const error = statisticsOutcome.error;
+      if (
+        error instanceof WarframeMarketValidationError ||
+        error instanceof WarframeMarketNotFoundError
+      ) {
+        throw error;
+      }
+      if (!(error instanceof WarframeMarketError)) throw error;
+      warnings.push(`Historical statistics were unavailable: ${error.message}`);
+    }
+
+    const liquidityOrders = orders.orders.map((order) => toLiquidityOrder(order, order.type));
+    const variants = collectLiquidityVariants(liquidityOrders, statisticsVariants, variant);
+    const topResults = await Promise.allSettled(
+      variants.map((entry) => this.getTopOrders(normalizedSlug, filters, entry)),
+    );
+    const topOrdersByVariant = new Map<string, MarketVariantTopOrders>();
+    const retrievedAtValues = [orders.retrieved_at];
+    if (statisticsRetrievedAt) retrievedAtValues.push(statisticsRetrievedAt);
+
+    topResults.forEach((result, index) => {
+      const entry = variants[index];
+      if (!entry) return;
+      const key = marketVariantKey(entry);
+      if (result.status === "fulfilled") {
+        const sell = result.value.sell.map((order) => toLiquidityOrder(order, "sell"));
+        const buy = result.value.buy.map((order) => toLiquidityOrder(order, "buy"));
+        const topOrdersMatchVariant = [...sell, ...buy].every(
+          (order) => marketVariantKey(marketVariantFromOrder(order)) === key,
+        );
+        if (topOrdersMatchVariant) {
+          topOrdersByVariant.set(key, { sell, buy });
+        } else {
+          warnings.push(
+            `Exact top orders did not preserve variant ${key}; best prices were derived from the full current-order snapshot.`,
+          );
+        }
+        retrievedAtValues.push(result.value.retrieved_at);
+      } else {
+        warnings.push(
+          `Exact top orders were unavailable for variant ${key}; best prices were derived from the full current-order snapshot.`,
+        );
+      }
+    });
+
+    return {
+      item: {
+        slug: normalizedSlug,
+        url: itemUrl(normalizedSlug),
+      },
+      filters: {
+        platform: filters.platform,
+        crossplay: filters.crossplay,
+        ...(variant ? { variant } : {}),
+      },
+      variants: buildLiquidityVariants(variants, liquidityOrders, statisticsVariants, {
+        historyStatus,
+        historyUnavailableReason,
+        topOrdersByVariant,
+      }),
+      retrievedAt: retrievedAtValues.sort().at(-1) ?? orders.retrieved_at,
+      warnings: [...new Set(warnings)],
+    };
+  }
+
   private async getItems(filters: MarketFilters): Promise<ItemsResult> {
     const path = "/items";
     return loadCached(
@@ -607,10 +1106,38 @@ export class WarframeMarketClient {
     filters: MarketFilters,
     itemSlug?: string,
   ): Promise<RequestResult<T>> {
+    const result = await this.requestJson<ApiEnvelope<T>>(
+      this.baseUrl,
+      path,
+      filters,
+      itemSlug,
+    );
+    if (!isRecord(result.body) || !("data" in result.body)) {
+      throw new WarframeMarketMalformedResponseError(
+        "Warframe Market API вернул некорректный JSON-ответ.",
+      );
+    }
+
+    const envelope = result.body as ApiEnvelope<T>;
+    if (envelope.error || envelope.data === null || envelope.data === undefined) {
+      throw new WarframeMarketUnavailableError(
+        "Warframe Market API вернул ошибку в ответе.",
+      );
+    }
+
+    return { data: envelope.data, retrievedAt: result.retrievedAt };
+  }
+
+  private async requestJson<T>(
+    baseUrl: string,
+    path: string,
+    filters: MarketFilters,
+    itemSlug?: string,
+  ): Promise<JsonRequestResult<T>> {
     for (let attempt = 0; attempt <= this.maxRetries; attempt += 1) {
-      let result: RequestResult<T> | Response;
+      let result: JsonRequestResult<T> | Response;
       try {
-        result = await this.requestAttempt<T>(path, filters, itemSlug);
+        result = await this.requestJsonAttempt<T>(baseUrl, path, filters, itemSlug);
       } catch (error) {
         if (!(error instanceof RetryableNetworkError)) throw error;
 
@@ -660,18 +1187,19 @@ export class WarframeMarketClient {
     throw new WarframeMarketUnavailableError("Warframe Market API временно недоступен.");
   }
 
-  private async requestAttempt<T>(
+  private async requestJsonAttempt<T>(
+    baseUrl: string,
     path: string,
     filters: MarketFilters,
     itemSlug?: string,
-  ): Promise<RequestResult<T> | Response> {
+  ): Promise<JsonRequestResult<T> | Response> {
     await this.limiter.acquire();
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
 
     let response: Response;
     try {
-      response = await this.fetcher(`${this.baseUrl}${path}`, {
+      response = await this.fetcher(`${baseUrl}${path}`, {
         headers: {
           Accept: "application/json",
           "User-Agent": this.userAgent,
@@ -737,28 +1265,15 @@ export class WarframeMarketClient {
         );
       }
 
-      throw new WarframeMarketUnavailableError(
+      throw new WarframeMarketMalformedResponseError(
         "Warframe Market API вернул некорректный JSON-ответ.",
       );
     } finally {
       clearTimeout(timeout);
     }
 
-    if (!isRecord(body) || !("data" in body)) {
-      throw new WarframeMarketUnavailableError(
-        "Warframe Market API вернул некорректный JSON-ответ.",
-      );
-    }
-
-    const envelope = body as ApiEnvelope<T>;
-    if (envelope.error || envelope.data === null || envelope.data === undefined) {
-      throw new WarframeMarketUnavailableError(
-        "Warframe Market API вернул ошибку в ответе.",
-      );
-    }
-
     return {
-      data: envelope.data,
+      body: body as T,
       retrievedAt: this.now().toISOString(),
     };
   }

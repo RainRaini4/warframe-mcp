@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMcpHandler } from "agents/mcp";
 import { z } from "zod";
+import type { MarketVariantKey } from "./market-analytics.js";
 import {
   parseWfmItemDocumentId,
   toOpenAiFetchDocument,
@@ -47,11 +48,17 @@ const filterOutputSchema = z.object({
 
 const orderOutputSchema = z.object({
   id: z.string(),
+  type: z.enum(["sell", "buy"]).optional(),
   platinum: z.number(),
   quantity: z.number(),
   per_trade: z.number().optional(),
   rank: z.number().optional(),
   subtype: z.string().optional(),
+  charges: z.number().optional(),
+  amberStars: z.number().optional(),
+  cyanStars: z.number().optional(),
+  visible: z.boolean().optional(),
+  created_at: z.string().optional(),
   updated_at: z.string().optional(),
   user: z.object({
     ingame_name: z.string(),
@@ -61,6 +68,125 @@ const orderOutputSchema = z.object({
     crossplay: z.boolean(),
   }),
 });
+
+const variantInputSchema = {
+  rank: z.number().int().min(0).optional().describe("Exact item rank"),
+  subtype: z.string().trim().min(1).max(100).optional().describe("Exact item subtype"),
+  charges: z.number().int().min(0).optional().describe("Exact remaining charges"),
+  amberStars: z.number().int().min(0).optional().describe("Exact amber star count"),
+  cyanStars: z.number().int().min(0).optional().describe("Exact cyan star count"),
+};
+
+const variantOutputSchema = z.object({
+  rank: z.number().int().min(0).optional(),
+  subtype: z.string().optional(),
+  charges: z.number().int().min(0).optional(),
+  amberStars: z.number().int().min(0).optional(),
+  cyanStars: z.number().int().min(0).optional(),
+});
+
+const statisticPointOutputSchema = z.object({
+  datetime: z.string(),
+  volume: z.number().nullable(),
+  minPrice: z.number().nullable(),
+  maxPrice: z.number().nullable(),
+  averagePrice: z.number().nullable(),
+  weightedAveragePrice: z.number().nullable(),
+  medianPrice: z.number().nullable(),
+  openPrice: z.number().nullable(),
+  closePrice: z.number().nullable(),
+  variant: variantOutputSchema,
+});
+
+const statisticsSummaryOutputSchema = z.object({
+  reportedClosedVolume: z.number(),
+  bucketCount: z.number().int().min(0),
+  bucketsWithVolume: z.number().int().min(0),
+  averageVolumePerBucket: z.number().nullable(),
+  latestMedianPrice: z.number().nullable(),
+  weightedMedianPrice: z.number().nullable(),
+  weightedAveragePrice: z.number().nullable(),
+  firstTimestamp: z.string().nullable(),
+  lastTimestamp: z.string().nullable(),
+});
+
+const statisticsVariantOutputSchema = z.object({
+  variant: variantOutputSchema,
+  closed: z.object({
+    hours48: z.array(statisticPointOutputSchema),
+    days90: z.array(statisticPointOutputSchema),
+  }),
+  summaries: z.object({
+    hours48: statisticsSummaryOutputSchema.nullable(),
+    days90: statisticsSummaryOutputSchema.nullable(),
+  }),
+});
+
+const statisticsOutputSchema = {
+  item: z.object({
+    slug: z.string(),
+    url: z.string().url(),
+  }),
+  filters: z.object({
+    platform: z.enum(MARKET_PLATFORMS),
+    crossplay: z.boolean(),
+    variant: variantOutputSchema.optional(),
+  }),
+  status: z.enum(["available", "empty", "unsupported_variant_dimensions"]),
+  variants: z.array(statisticsVariantOutputSchema),
+  source: z.object({
+    api: z.literal("warframe-market-v1"),
+    deprecated: z.literal(true),
+    description: z.string(),
+  }),
+  retrievedAt: z.string(),
+  warnings: z.array(z.string()),
+};
+
+const liquidityVariantOutputSchema = z.object({
+  variant: variantOutputSchema,
+  currentMarket: z.object({
+    activeSellOrders: z.number().int().min(0),
+    activeBuyOrders: z.number().int().min(0),
+    onlineSellOrders: z.number().int().min(0),
+    onlineBuyOrders: z.number().int().min(0),
+    bestSell: z.number().nullable(),
+    bestBuy: z.number().nullable(),
+    midpoint: z.number().nullable(),
+    absoluteSpread: z.number().nullable(),
+    spreadPercent: z.number().nullable(),
+    sellDepthAtBestPrice: z.number().min(0),
+    buyDepthAtBestPrice: z.number().min(0),
+  }),
+  history: z.object({
+    reportedClosedVolume48h: z.number().nullable(),
+    reportedClosedVolume90d: z.number().nullable(),
+    averageDailyClosedVolume90d: z.number().nullable(),
+    latestMedianPrice48h: z.number().nullable(),
+    weightedAveragePrice48h: z.number().nullable(),
+  }),
+  assessment: z.object({
+    score: z.number().min(0).max(100).nullable(),
+    grade: z.enum(["very_high", "high", "medium", "low", "very_low", "unknown"]),
+    confidence: z.enum(["high", "medium", "low"]),
+    reasons: z.array(z.string()),
+  }),
+});
+
+const liquidityOutputSchema = {
+  item: z.object({
+    slug: z.string(),
+    url: z.string().url(),
+  }),
+  filters: z.object({
+    platform: z.enum(MARKET_PLATFORMS),
+    crossplay: z.boolean(),
+    variant: variantOutputSchema.optional(),
+  }),
+  variants: z.array(liquidityVariantOutputSchema),
+  retrievedAt: z.string(),
+  warnings: z.array(z.string()),
+};
 
 const openAiSearchOutputSchema = {
   results: z.array(
@@ -101,6 +227,16 @@ function resolveToolFilters(input: Partial<MarketFilters>): MarketFilters {
     platform: input.platform ?? DEFAULT_MARKET_FILTERS.platform,
     crossplay: input.crossplay ?? DEFAULT_MARKET_FILTERS.crossplay,
   };
+}
+
+function resolveVariantFilter(input: MarketVariantKey): MarketVariantKey | undefined {
+  const variant: MarketVariantKey = {};
+  if (input.rank !== undefined) variant.rank = input.rank;
+  if (input.subtype !== undefined) variant.subtype = input.subtype;
+  if (input.charges !== undefined) variant.charges = input.charges;
+  if (input.amberStars !== undefined) variant.amberStars = input.amberStars;
+  if (input.cyanStars !== undefined) variant.cyanStars = input.cyanStars;
+  return Object.keys(variant).length > 0 ? variant : undefined;
 }
 
 function toolError(error: unknown) {
@@ -225,6 +361,131 @@ export function createWorkerMcpServer(
           `Top orders: ${result.item.slug}`,
           `Sell: ${formatOrders(result.sell)}`,
           `Buy: ${formatOrders(result.buy)}`,
+        ].join("\n");
+
+        return {
+          content: [{ type: "text", text }],
+          structuredContent: { ...result },
+        };
+      } catch (error) {
+        return toolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "wfm_get_item_statistics",
+    {
+      description:
+        "Get deprecated Warframe Market v1 closed-order statistics for the last 48 hours and 90 days. Reported volume is not a complete or independently verified count of in-game trades. Rank, subtype, charges, and Ayatan star variants are never intentionally combined.",
+      inputSchema: {
+        slug: z.string().trim().min(1).max(200).describe("Slug from wfm_search_items"),
+        platform: z
+          .enum(MARKET_PLATFORMS)
+          .default(DEFAULT_MARKET_FILTERS.platform)
+          .optional()
+          .describe("Trading platform"),
+        crossplay: z
+          .boolean()
+          .default(DEFAULT_MARKET_FILTERS.crossplay)
+          .optional()
+          .describe("Include crossplay-compatible statistics"),
+        ...variantInputSchema,
+      },
+      outputSchema: statisticsOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+    },
+    async ({
+      slug,
+      platform,
+      crossplay,
+      rank,
+      subtype,
+      charges,
+      amberStars,
+      cyanStars,
+    }) => {
+      try {
+        const result = await client.getItemStatistics(
+          slug,
+          resolveToolFilters({ platform, crossplay }),
+          resolveVariantFilter({ rank, subtype, charges, amberStars, cyanStars }),
+        );
+        const text = [
+          `Closed-order statistics: ${result.item.slug}`,
+          `Status: ${result.status}`,
+          `Variants: ${result.variants.length}`,
+          `Retrieved at: ${result.retrievedAt}`,
+          ...result.warnings.map((warning) => `Warning: ${warning}`),
+        ].join("\n");
+
+        return {
+          content: [{ type: "text", text }],
+          structuredContent: { ...result },
+        };
+      } catch (error) {
+        return toolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "wfm_get_item_liquidity",
+    {
+      description:
+        "Estimate item liquidity per exact rank, subtype, charges, or Ayatan star variant from the current visible order book and deprecated closed-order statistics. Returns a deterministic 0-100 local heuristic, grade, confidence, component metrics, reasons, and explicit warnings; it does not predict execution or profit.",
+      inputSchema: {
+        slug: z.string().trim().min(1).max(200).describe("Slug from wfm_search_items"),
+        platform: z
+          .enum(MARKET_PLATFORMS)
+          .default(DEFAULT_MARKET_FILTERS.platform)
+          .optional()
+          .describe("Trading platform"),
+        crossplay: z
+          .boolean()
+          .default(DEFAULT_MARKET_FILTERS.crossplay)
+          .optional()
+          .describe("Include crossplay-compatible orders and statistics"),
+        ...variantInputSchema,
+      },
+      outputSchema: liquidityOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+    },
+    async ({
+      slug,
+      platform,
+      crossplay,
+      rank,
+      subtype,
+      charges,
+      amberStars,
+      cyanStars,
+    }) => {
+      try {
+        const result = await client.getItemLiquidity(
+          slug,
+          resolveToolFilters({ platform, crossplay }),
+          resolveVariantFilter({ rank, subtype, charges, amberStars, cyanStars }),
+        );
+        const variantLines = result.variants.map(
+          (entry) =>
+            `${JSON.stringify(entry.variant)}: score=${entry.assessment.score ?? "unknown"}, grade=${entry.assessment.grade}, confidence=${entry.assessment.confidence}`,
+        );
+        const text = [
+          `Liquidity estimate: ${result.item.slug}`,
+          ...variantLines,
+          `Retrieved at: ${result.retrievedAt}`,
+          ...result.warnings.map((warning) => `Warning: ${warning}`),
         ].join("\n");
 
         return {

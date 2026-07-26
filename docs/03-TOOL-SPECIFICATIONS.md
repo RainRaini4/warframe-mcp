@@ -1,8 +1,8 @@
 # MCP Tool Specifications
 
-The Cloudflare Worker publishes four read-only tools: two direct market tools and the OpenAI-compatible `search`/`fetch` pair. The numbered sections retain specifications for the legacy Node tool set.
+The Cloudflare Worker publishes six read-only tools: four direct market tools and the OpenAI-compatible `search`/`fetch` pair. The numbered sections retain specifications for the legacy Node tool set.
 
-The direct `wfm_*` tools accept optional filters with defaults:
+All direct `wfm_*` tools accept optional `platform` and `crossplay` filters. Search and top-orders also expose `language`:
 
 ```typescript
 {
@@ -12,7 +12,7 @@ The direct `wfm_*` tools accept optional filters with defaults:
 }
 ```
 
-Every successful `wfm_*` response includes short text `content`, matching `structuredContent`, the applied `filters`, and an ISO 8601 `retrieved_at` timestamp. All four Worker tools set `readOnlyHint=true`, `destructiveHint=false`, and make no authenticated or mutating requests.
+Every successful `wfm_*` response includes short text `content`, matching `structuredContent`, applied `filters`, and an ISO 8601 retrieval timestamp (`retrieved_at` for search/top orders, `retrievedAt` for statistics/liquidity). All six Worker tools set `readOnlyHint=true`, `destructiveHint=false`, and make no authenticated or mutating requests.
 
 The shared Worker client limits external request starts to three per second per isolate. It retries `429`, `509`, temporary `5xx`, and network failures, honors `Retry-After`, and otherwise uses bounded exponential backoff with jitter. It does not retry `400`, `403`, `404`, validation errors, or timeouts. Identical concurrent endpoint/filter requests are deduplicated.
 
@@ -44,6 +44,78 @@ z.object({
 ```
 
 Calls `GET /v2/orders/item/{slug}/top`, cached for 20 seconds. The `sell` list is sorted by platinum ascending and `buy` by platinum descending. Each compact order includes its ID, price, quantity, available item qualifiers, update time, and public user summary.
+
+## Worker: `wfm_get_item_statistics`
+
+```typescript
+z.object({
+  slug: z.string().trim().min(1).max(200),
+  platform: MarketPlatform.default("pc").optional(),
+  crossplay: z.boolean().default(true).optional(),
+  rank: z.number().int().min(0).optional(),
+  subtype: z.string().trim().min(1).max(100).optional(),
+  charges: z.number().int().min(0).optional(),
+  amberStars: z.number().int().min(0).optional(),
+  cyanStars: z.number().int().min(0).optional()
+})
+```
+
+The item must exist in the v2 catalog, and supplied variant values must be supported by its declared limits. The tool then reads deprecated v1 closed-order buckets for `48hours` and `90days`, cached for five minutes. Raw history is cached independently of the requested exact variant and normalized after retrieval.
+
+Each result variant contains normalized closed buckets and summaries with reported volume, bucket counts, average bucket volume, latest median, volume-weighted median, volume-weighted average price, and time bounds. Status is `available`, `empty`, or `unsupported_variant_dimensions`. Missing values remain `null`; unknown legacy fields are skipped with warnings.
+
+Rank, subtype, charges, amber stars, and cyan stars are never intentionally combined across variants. If the current catalog declares a dimension absent from the legacy response, the tool returns `unsupported_variant_dimensions` rather than a misleading aggregate. Every result marks its source as deprecated and explains that reported closed volume is not a complete or independently verified record of in-game trades.
+
+## Worker: `wfm_get_item_liquidity`
+
+Input is the same as `wfm_get_item_statistics`. The result contains one entry per exact variant, or only the requested variant when a filter is supplied:
+
+```typescript
+interface LiquidityVariantResult {
+  variant: { rank?: number; subtype?: string; charges?: number; amberStars?: number; cyanStars?: number };
+  currentMarket: {
+    activeSellOrders: number;
+    activeBuyOrders: number;
+    onlineSellOrders: number;
+    onlineBuyOrders: number;
+    bestSell: number | null;
+    bestBuy: number | null;
+    midpoint: number | null;
+    absoluteSpread: number | null;
+    spreadPercent: number | null;
+    sellDepthAtBestPrice: number;
+    buyDepthAtBestPrice: number;
+  };
+  history: {
+    reportedClosedVolume48h: number | null;
+    reportedClosedVolume90d: number | null;
+    averageDailyClosedVolume90d: number | null;
+    latestMedianPrice48h: number | null;
+    weightedAveragePrice48h: number | null;
+  };
+  assessment: {
+    score: number | null;
+    grade: "very_high" | "high" | "medium" | "low" | "very_low" | "unknown";
+    confidence: "high" | "medium" | "low";
+    reasons: string[];
+  };
+}
+```
+
+Current counts and best-price depth come from the full visible `/v2/orders/item/{slug}` snapshot; online means `online` or `ingame`. Exact variant-filtered `/top` calls supply current best prices and fall back to the full snapshot with a warning on failure. Midpoint is `(bestSell + bestBuy) / 2`; spread percent is `(bestSell - bestBuy) / midpoint × 100`, clamped to a non-negative absolute spread. A missing side produces `null` midpoint and spread.
+
+The deterministic local score is:
+
+```text
+volume = 50 × min(1, log1p(averageDailyClosedVolume90d) / log1p(50))
+depth  = 25 × min(1, log1p(min(onlineSellOrders, onlineBuyOrders)) / log1p(20))
+spread = 25 × max(0, min(1, 1 - spreadPercent / 50))
+score  = round-to-0.1(clamp(volume + depth + spread, 0, 100))
+```
+
+Grades are `very_high` for 85–100, `high` for 70–84.9, `medium` for 50–69.9, `low` for 25–49.9, and `very_low` below 25. Confidence is `high` only when both history windows and both online order sides exist; it is `medium` with usable 90-day history but incomplete supporting signals. Without usable 90-day history, score is `null`, grade is `unknown`, and confidence is `low`.
+
+Reasons are stable machine-readable labels such as `high_90d_volume`, `low_90d_volume`, `deep_two_sided_market`, `one_sided_market`, `tight_spread`, `wide_spread`, `spread_unavailable`, and history-degradation reasons. This score is a local heuristic, not a guarantee of execution speed, executable price, or profit.
 
 ## Worker: `search`
 

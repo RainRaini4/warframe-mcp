@@ -18,6 +18,7 @@ const ITEMS = [
   {
     id: "item-titania",
     slug: "titania_prime",
+    maxRank: 5,
     i18n: {
       ru: { name: "Титания Прайм" },
       en: { name: "Titania Prime" },
@@ -100,6 +101,47 @@ const TOP_ORDERS = {
       },
     },
   ],
+};
+
+const FULL_ORDERS = [...TOP_ORDERS.sell, ...TOP_ORDERS.buy].map((order) => ({
+  ...order,
+  visible: true,
+  rank: 5,
+}));
+
+const LEGACY_STATISTICS = {
+  payload: {
+    statistics_closed: {
+      "48hours": [
+        {
+          datetime: "2026-07-26T08:00:00.000Z",
+          volume: 3,
+          min_price: 90,
+          max_price: 110,
+          open_price: 95,
+          closed_price: 105,
+          avg_price: 100,
+          wa_price: 101,
+          median: 100,
+          mod_rank: 5,
+        },
+      ],
+      "90days": [
+        {
+          datetime: "2026-07-25T00:00:00.000Z",
+          volume: 90,
+          min_price: 80,
+          max_price: 120,
+          open_price: 90,
+          closed_price: 100,
+          avg_price: 99,
+          wa_price: 100,
+          median: 100,
+          mod_rank: 5,
+        },
+      ],
+    },
+  },
 };
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -356,6 +398,8 @@ describe("Cloudflare Worker", () => {
       expect(result.tools.map((tool) => tool.name)).toEqual([
         "wfm_search_items",
         "wfm_get_top_orders",
+        "wfm_get_item_statistics",
+        "wfm_get_item_liquidity",
         "search",
         "fetch",
       ]);
@@ -450,6 +494,130 @@ describe("Cloudflare Worker", () => {
       expect(data.sell.map((order) => order.platinum)).toEqual([42, 48]);
       expect(data.buy.map((order) => order.platinum)).toEqual([40, 35]);
       expect(new Date(data.retrieved_at).toISOString()).toBe(data.retrieved_at);
+    });
+  });
+
+  it("returns normalized deprecated statistics through MCP", async () => {
+    vi.stubGlobal(
+      "fetch",
+      createFetch((input) => {
+        const url = requestUrl(input);
+        if (url === "https://api.warframe.market/v2/items") {
+          return jsonResponse({ apiVersion: "0.25.0", data: ITEMS, error: null });
+        }
+        if (
+          url ===
+          "https://api.warframe.market/v1/items/titania_prime/statistics"
+        ) {
+          return jsonResponse(LEGACY_STATISTICS);
+        }
+        throw new Error(`Unexpected Warframe Market request: ${url}`);
+      }),
+    );
+
+    await withMcpClient(async (client) => {
+      const result = await client.callTool({
+        name: "wfm_get_item_statistics",
+        arguments: { slug: "titania_prime", rank: 5 },
+      });
+      const data = result.structuredContent as {
+        status: string;
+        variants: Array<{
+          variant: { rank?: number };
+          summaries: { days90: { reportedClosedVolume: number } | null };
+        }>;
+        source: { api: string; deprecated: boolean };
+        warnings: string[];
+      };
+      const content = (result.content as Array<{ type: "text"; text: string }>)[0];
+
+      expect(result.isError).not.toBe(true);
+      expect(data.status).toBe("available");
+      expect(data.variants).toHaveLength(1);
+      expect(data.variants[0]?.variant).toEqual({ rank: 5 });
+      expect(data.variants[0]?.summaries.days90?.reportedClosedVolume).toBe(90);
+      expect(data.source).toEqual({
+        api: "warframe-market-v1",
+        deprecated: true,
+        description: expect.stringContaining("Deprecated"),
+      });
+      expect(data.warnings.join(" ")).toContain("deprecated");
+      expect(content?.text).toContain("Warning:");
+    });
+  });
+
+  it("returns a variant-safe liquidity assessment through MCP", async () => {
+    vi.stubGlobal(
+      "fetch",
+      createFetch((input) => {
+        const url = requestUrl(input);
+        if (url === "https://api.warframe.market/v2/items") {
+          return jsonResponse({ apiVersion: "0.25.0", data: ITEMS, error: null });
+        }
+        if (url === "https://api.warframe.market/v2/orders/item/titania_prime") {
+          return jsonResponse({ apiVersion: "0.25.0", data: FULL_ORDERS, error: null });
+        }
+        if (
+          url ===
+          "https://api.warframe.market/v1/items/titania_prime/statistics"
+        ) {
+          return jsonResponse(LEGACY_STATISTICS);
+        }
+        if (
+          url === "https://api.warframe.market/v2/orders/item/titania_prime/top?rank=5"
+        ) {
+          return jsonResponse({ apiVersion: "0.25.0", data: TOP_ORDERS, error: null });
+        }
+        throw new Error(`Unexpected Warframe Market request: ${url}`);
+      }),
+    );
+
+    await withMcpClient(async (client) => {
+      const result = await client.callTool({
+        name: "wfm_get_item_liquidity",
+        arguments: { slug: "titania_prime", rank: 5 },
+      });
+      const data = result.structuredContent as {
+        variants: Array<{
+          variant: { rank?: number };
+          currentMarket: {
+            bestSell: number | null;
+            bestBuy: number | null;
+            sellDepthAtBestPrice: number;
+            buyDepthAtBestPrice: number;
+          };
+          history: { averageDailyClosedVolume90d: number | null };
+          assessment: {
+            score: number | null;
+            grade: string;
+            confidence: string;
+            reasons: string[];
+          };
+        }>;
+        warnings: string[];
+      };
+      const content = (result.content as Array<{ type: "text"; text: string }>)[0];
+
+      expect(result.isError).not.toBe(true);
+      expect(data.variants).toHaveLength(1);
+      expect(data.variants[0]).toMatchObject({
+        variant: { rank: 5 },
+        currentMarket: {
+          bestSell: 42,
+          bestBuy: 40,
+          sellDepthAtBestPrice: 2,
+          buyDepthAtBestPrice: 3,
+        },
+        history: { averageDailyClosedVolume90d: 1 },
+        assessment: {
+          score: expect.any(Number),
+          grade: expect.any(String),
+          confidence: "high",
+        },
+      });
+      expect(data.warnings.join(" ")).toContain("local heuristic");
+      expect(content?.text).toContain("Liquidity estimate");
+      expect(content?.text).toContain("Warning:");
     });
   });
 

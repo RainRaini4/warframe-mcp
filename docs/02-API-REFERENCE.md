@@ -457,11 +457,11 @@ See `docs/07-PLAYER-DATA.md` for full schema.
 
 ---
 
-## warframe.market v2
+## warframe.market APIs
 
-**Base URL:** `https://api.warframe.market/v2`
+**Primary base URL:** `https://api.warframe.market/v2`
 
-**NEVER use `/v1/`** — returns 403.
+The Worker uses v2 for the item catalog and current orders. It uses the deprecated and unsupported `https://api.warframe.market/v1` only for closed-order statistics. The legacy route is never a hard dependency: callers receive current liquidity metrics with an unknown score when history is unavailable.
 
 **Rate limit:** 3 req/sec. The Worker uses one sliding-window limiter per isolate. `429`, `509`, temporary `5xx`, and network failures are retried up to two times. `Retry-After` takes precedence over bounded exponential backoff with jitter.
 
@@ -475,7 +475,7 @@ Platform: pc
 Crossplay: true
 ```
 
-The final three values can be overridden by MCP tool arguments. Defaults are shown above.
+`Platform` and `Crossplay` can be overridden by every direct market tool. `Language` is exposed by search and top-orders; statistics and liquidity use the default language because their normalized contracts contain no localized fields. Defaults are shown above.
 
 ---
 
@@ -523,6 +523,8 @@ Returns up to five current sell orders and five current buy orders from online u
 
 The Worker sorts `sell` by `platinum` ascending and `buy` by `platinum` descending before returning the MCP result. Top orders are cached in the isolate for 20 seconds.
 
+For variant-safe liquidity, the Worker passes exact supported query parameters: `rank`, `subtype`, `charges`, `amberStars`, and `cyanStars`. `perTrade` is order lot size and is not an item variant dimension.
+
 ---
 
 ### `GET /v2/orders/item/{slug}`
@@ -556,7 +558,49 @@ The Worker sorts `sell` by `platinum` ascending and `buy` by `platinum` descendi
 - `user.status`: `"ingame"` | `"online"` | `"offline"`. **Filter out `"offline"` for live pricing.**
 - `user.crossplay`: trades cross-platform if true.
 
+The liquidity tool uses every visible order for active counts, only `online`/`ingame` users for online counts and best-price depth, and exact `/top` responses for authoritative current best prices. Full orders are cached for 20 seconds.
+
 Price logic:
 1. Filter `type === "sell"`, `user.status !== "offline"` → sort ascending → min/max/median/average.
 2. Filter `type === "buy"`, `user.status !== "offline"` → sort descending → min/max/median/average.
 3. Cheapest sellers = first 5 of sorted sell array.
+
+---
+
+### `GET /v1/items/{slug}/statistics` (deprecated)
+
+This route is deprecated and unsupported by Warframe Market but currently returns closed-order buckets. The Worker requests it with the same `Platform` and `Crossplay` context as current orders, caches the raw response for five minutes, and never treats it as required for current market access.
+
+```json
+{
+  "payload": {
+    "statistics_closed": {
+      "48hours": [
+        {
+          "datetime": "2026-07-26T08:00:00.000Z",
+          "volume": 3,
+          "min_price": 90,
+          "max_price": 110,
+          "avg_price": 100,
+          "wa_price": 101,
+          "median": 100,
+          "mod_rank": 5
+        }
+      ],
+      "90days": []
+    }
+  }
+}
+```
+
+Normalization maps `mod_rank` to `rank`, `amber_stars` to `amberStars`, and `cyan_stars` to `cyanStars`. Each exact combination of `rank`, `subtype`, `charges`, `amberStars`, and `cyanStars` is processed separately. If the v2 catalog declares a variant dimension that the legacy payload omits, the result status is `unsupported_variant_dimensions` and the Worker refuses to aggregate it.
+
+Unknown legacy fields cause affected buckets to be ignored with a warning. Missing numeric values remain `null`; they are not replaced with zero. `reportedClosedVolume` means volume reported by Warframe Market and is not a complete or independently verified count of in-game trades.
+
+Failure semantics:
+
+- unknown catalog slug: `not_found`, before the legacy route is called;
+- known item but legacy `404`: `statistics_unavailable`;
+- invalid JSON or missing `payload.statistics_closed`: `malformed_response`;
+- empty ranges: successful `empty` result;
+- liquidity call: any legacy availability failure becomes a warning, current metrics remain available, and score/grade become `null`/`unknown`.

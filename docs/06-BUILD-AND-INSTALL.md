@@ -130,9 +130,14 @@ warframe-mcp/
 ├── vitest.config.ts
 ├── wrangler.jsonc
 ├── worker/
-│   └── index.ts
+│   ├── index.ts
+│   ├── market-analytics.ts
+│   ├── openai-compat.ts
+│   └── warframe-market.ts
 ├── test/
+│   ├── market-analytics.test.ts
 │   ├── server.test.mjs
+│   ├── warframe-market.test.ts
 │   ├── worker.test.ts
 │   └── tsconfig.json
 ├── src/
@@ -179,10 +184,23 @@ The Worker exposes:
 
 - `wfm_search_items` — Russian/English/slug item lookup;
 - `wfm_get_top_orders` — current top sell and buy orders;
+- `wfm_get_item_statistics` — deprecated 48-hour/90-day closed-order statistics, normalized per exact variant;
+- `wfm_get_item_liquidity` — current order metrics plus a deterministic, variant-safe liquidity heuristic;
 - `search` — up to ten citable items with stable `wfm:item:<slug>` IDs;
 - `fetch` — a current market document for an ID returned by `search`.
 
-All tools use `language=ru`, `platform=pc`, and `crossplay=true` by default. They need no credentials or environment variables. For OpenAI-compatible clients, call `search({"query":"Титания Прайм"})` and pass a returned ID to `fetch`.
+All tools use `platform=pc` and `crossplay=true` by default; tools with a language argument default to `language=ru`. They need no credentials or environment variables. For OpenAI-compatible clients, call `search({"query":"Титания Прайм"})` and pass a returned ID to `fetch`. For rankable or otherwise variant items, pass exact `rank`, `subtype`, `charges`, `amberStars`, or `cyanStars` to statistics/liquidity calls.
+
+Local Worker smoke sequence:
+
+1. Run `npm run dev`.
+2. Connect an MCP client to `http://127.0.0.1:8787/mcp` and complete `initialize`.
+3. Confirm `tools/list` returns the six tools above.
+4. Call both statistics and liquidity for `arcane_energize` at two exact ranks and confirm the variants are not combined.
+5. Repeat with a non-ranked Prime component, a ranked mod, and an item whose current `/v2/items` descriptor declares `subtypes`.
+6. Check `retrievedAt`, `warnings`, the deprecated source marker, and the `score=null` fallback if history is unavailable.
+
+The smoke sequence calls public Warframe Market endpoints. The automated test suite stubs `fetch` and does not depend on external availability.
 
 Production deployment requires an authenticated Wrangler session:
 
@@ -268,5 +286,6 @@ console.error("[DEBUG] fetchVoidTrader:", JSON.stringify(data, null, 2));
 
 - The production target is the stateless Cloudflare Worker at `/mcp`; it has no auth, Durable Objects, KV, D1, or persistent storage.
 - The legacy Node entrypoint remains available as a local stdio subprocess or Express HTTP server.
-- Item search reuses the in-isolate six-hour catalog cache, while top orders use a 20-second cache. Cold or expired requests require Warframe Market API access.
+- Item search reuses the in-isolate six-hour catalog cache, current full/top orders use a 20-second cache, and deprecated statistics use a five-minute cache. Cold or expired requests require Warframe Market API access.
+- `npm run check` is the required pre-completion verification: type-check, automated tests, and Worker deployment dry run.
 - No environment variables required.
