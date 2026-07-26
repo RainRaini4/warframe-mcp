@@ -6,8 +6,10 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
-    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.worker.json && tsc --noEmit -p test/tsconfig.json",
-    "test": "npm run build && node --test test/server.test.mjs && vitest run",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.worker.json && tsc --noEmit -p test/tsconfig.json && tsc --noEmit -p test/node/tsconfig.json",
+    "test": "npm run build && node --test test/server.test.mjs && npm run test:node && npm run test:worker",
+    "test:node": "vitest run --config vitest.node.config.ts",
+    "test:worker": "vitest run",
     "check": "npm run typecheck && npm test && npm run deploy:dry",
     "start": "node dist/index.js",
     "start:http": "node dist/index.js --http",
