@@ -2,6 +2,78 @@
 
 Copy these verbatim into `src/types/`. Do not modify field names — they match API JSON keys exactly.
 
+The production Worker keeps its smaller public market types in `worker/warframe-market.ts` and its OpenAI compatibility types in `worker/openai-compat.ts`. Its MCP shapes are:
+
+```typescript
+interface MarketFilters {
+  language: MarketLanguage;
+  platform: MarketPlatform;
+  crossplay: boolean;
+}
+
+interface MarketSearchItem {
+  id: string;
+  slug: string;
+  name_ru: string;
+  name_en: string;
+  url: string;
+}
+
+interface SearchItemsResult {
+  query: string;
+  items: MarketSearchItem[];
+  filters: MarketFilters;
+  retrieved_at: string;
+}
+
+interface TopOrdersResult {
+  item: { slug: string; url: string };
+  sell: MarketTopOrder[];
+  buy: MarketTopOrder[];
+  filters: MarketFilters;
+  retrieved_at: string;
+}
+
+type WarframeMarketErrorCode =
+  | "validation"
+  | "not_found"
+  | "forbidden"
+  | "timeout"
+  | "rate_limited"
+  | "unavailable";
+
+interface OpenAiSearchOutput {
+  results: Array<{
+    id: string;       // wfm:item:<slug>
+    title: string;
+    text: string;
+    url: string;
+  }>;
+}
+
+interface OpenAiFetchDocument {
+  id: string;
+  title: string;
+  text: string;
+  url: string;
+  metadata: {
+    source: "warframe.market";
+    slug: string;
+    name_ru: string;
+    name_en: string;
+    language: MarketLanguage;
+    platform: MarketPlatform;
+    crossplay: boolean;
+    retrieved_at: string;
+    warning: string;
+    top_sell_orders: MarketTopOrder[];
+    top_buy_orders: MarketTopOrder[];
+  };
+}
+```
+
+The API response types below are retained for the legacy Node client.
+
 ---
 
 ## `src/types/warframestat.ts`

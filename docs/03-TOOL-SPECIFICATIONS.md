@@ -1,6 +1,102 @@
 # MCP Tool Specifications
 
-All 18 tools. Schema (Zod), API calls, processing, and copy-paste output format for each.
+The Cloudflare Worker publishes four read-only tools: two direct market tools and the OpenAI-compatible `search`/`fetch` pair. The numbered sections retain specifications for the legacy Node tool set.
+
+The direct `wfm_*` tools accept optional filters with defaults:
+
+```typescript
+{
+  language: "ru",
+  platform: "pc",
+  crossplay: true
+}
+```
+
+Every successful `wfm_*` response includes short text `content`, matching `structuredContent`, the applied `filters`, and an ISO 8601 `retrieved_at` timestamp. All four Worker tools set `readOnlyHint=true`, `destructiveHint=false`, and make no authenticated or mutating requests.
+
+The shared Worker client limits external request starts to three per second per isolate. It retries `429`, `509`, temporary `5xx`, and network failures, honors `Retry-After`, and otherwise uses bounded exponential backoff with jitter. It does not retry `400`, `403`, `404`, validation errors, or timeouts. Identical concurrent endpoint/filter requests are deduplicated.
+
+## Worker: `wfm_search_items`
+
+```typescript
+z.object({
+  query: z.string().trim().min(1).max(200),
+  limit: z.number().int().min(1).max(20).default(10).optional(),
+  language: MarketLanguage.default("ru").optional(),
+  platform: MarketPlatform.default("pc").optional(),
+  crossplay: z.boolean().default(true).optional()
+})
+```
+
+Search fields are Russian name, English name, and slug. Normalization covers case, Unicode decomposition, `ё`/`е`, punctuation, hyphens, underscores, and repeated whitespace. Exact normalized matches rank above substring matches; no fuzzy edit-distance search is performed.
+
+Each result contains `id`, `slug`, `name_ru`, `name_en`, and an absolute `https://warframe.market/items/{slug}` URL. The catalog cache TTL is six hours. When a non-Russian API language is requested, the client also obtains the cached Russian catalog so both required names remain available.
+
+## Worker: `wfm_get_top_orders`
+
+```typescript
+z.object({
+  slug: z.string().trim().min(1).max(200),
+  language: MarketLanguage.default("ru").optional(),
+  platform: MarketPlatform.default("pc").optional(),
+  crossplay: z.boolean().default(true).optional()
+})
+```
+
+Calls `GET /v2/orders/item/{slug}/top`, cached for 20 seconds. The `sell` list is sorted by platinum ascending and `buy` by platinum descending. Each compact order includes its ID, price, quantity, available item qualifiers, update time, and public user summary.
+
+## Worker: `search`
+
+The schema follows the [OpenAI MCP compatibility contract](https://developers.openai.com/api/docs/mcp):
+
+```typescript
+// Input
+z.object({ query: z.string().trim().min(1).max(200) })
+
+// Output
+z.object({
+  results: z.array(z.object({
+    id: z.string(),
+    title: z.string(),
+    text: z.string(),
+    url: z.string().url()
+  })).max(10)
+})
+```
+
+The tool delegates to the existing Russian/English/slug item search with the default filters. IDs are deterministic `wfm:item:<slug>` values. `id`, `title`, and absolute `url` are the standard compatibility fields; the short `text` field is an additive item summary. The output object is returned in `structuredContent` and duplicated as a JSON-encoded string in text `content`.
+
+## Worker: `fetch`
+
+```typescript
+// Input
+z.object({ id: z.string() })
+
+// Output
+z.object({
+  id: z.string(),
+  title: z.string(),
+  text: z.string(),
+  url: z.string().url(),
+  metadata: z.object({
+    source: z.literal("warframe.market"),
+    slug: z.string(),
+    name_ru: z.string(),
+    name_en: z.string(),
+    language: MarketLanguage,
+    platform: MarketPlatform,
+    crossplay: z.boolean(),
+    retrieved_at: z.string(),
+    warning: z.string(),
+    top_sell_orders: z.array(MarketTopOrder),
+    top_buy_orders: z.array(MarketTopOrder)
+  })
+})
+```
+
+Only IDs matching `wfm:item:<slug>` are accepted. The tool confirms that the slug exists through the item search service before requesting top orders. The document text and metadata include both localized names, the item URL, current sell/buy orders, actual platform/crossplay filters, retrieval time, and a warning that the data is a current market snapshot. As required by the OpenAI contract, `structuredContent` is duplicated as JSON in text `content`.
+
+## Legacy Node tools
 
 | # | Tool | API |
 |---|------|-----|

@@ -463,15 +463,25 @@ See `docs/07-PLAYER-DATA.md` for full schema.
 
 **NEVER use `/v1/`** — returns 403.
 
-**Rate limit:** 3 req/sec. Returns 429 on violation. Back off 1s and retry once.
+**Rate limit:** 3 req/sec. The Worker uses one sliding-window limiter per isolate. `429`, `509`, temporary `5xx`, and network failures are retried up to two times. `Retry-After` takes precedence over bounded exponential backoff with jitter.
 
-**Headers:** `Accept: application/json`
+**Worker headers:**
+
+```text
+Accept: application/json
+User-Agent: warframe-mcp/1.0.0 (Cloudflare Workers; read-only)
+Language: ru
+Platform: pc
+Crossplay: true
+```
+
+The final three values can be overridden by MCP tool arguments. Defaults are shown above.
 
 ---
 
 ### `GET /v2/items`
 
-All tradeable items. ~2MB. **Cache 24h.** Build name→slug lookup map from this.
+All tradeable items. ~2MB. **Worker cache: 6h.** With `Language: ru`, `i18n` contains Russian data in addition to English. The Worker searches normalized `i18n.ru.name`, `i18n.en.name`, and `slug`.
 
 ```json
 {
@@ -493,6 +503,25 @@ All tradeable items. ~2MB. **Cache 24h.** Build name→slug lookup map from this
 - `slug` = URL-safe ID for order queries.
 - `maxRank` present on mods/arcanes.
 - Build map: `i18n.en.name.toLowerCase()` → `slug`.
+
+---
+
+### `GET /v2/orders/item/{slug}/top`
+
+Returns up to five current sell orders and five current buy orders from online users:
+
+```json
+{
+  "apiVersion": "0.25.0",
+  "data": {
+    "sell": [],
+    "buy": []
+  },
+  "error": null
+}
+```
+
+The Worker sorts `sell` by `platinum` ascending and `buy` by `platinum` descending before returning the MCP result. Top orders are cached in the isolate for 20 seconds.
 
 ---
 

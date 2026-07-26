@@ -1,6 +1,6 @@
 # Warframe MCP Server — Overview
 
-TypeScript MCP server. Stdio transport. 18 tools. Real-time Warframe data via HTTP. No auth, no DB, no web server.
+The target runtime is a stateless Cloudflare Worker with Streamable HTTP at `/mcp` and health checks at `/healthz`. The Worker exposes the read-only `wfm_search_items`, `wfm_get_top_orders`, `search`, and `fetch` tools. The legacy Node entrypoint remains available with stdio, Express Streamable HTTP, and 19 Warframe tools.
 
 ## External Data Sources
 
@@ -9,20 +9,33 @@ TypeScript MCP server. Stdio transport. 18 tools. Real-time Warframe data via HT
 | warframestat.us | `https://api.warframestat.us` | Worldstate, items, weapons, mods, drops, player profiles |
 | warframe.market v2 | `https://api.warframe.market/v2` | Live P2P platinum trading prices |
 
-**DO NOT** add `@wfcd/items`, `warframe-worldstate-data`, `warframe-nexus-query`, `node-fetch`. All data comes from HTTP. Only 4 npm packages total.
+**DO NOT** add `@wfcd/items`, `warframe-worldstate-data`, `warframe-nexus-query`, or `node-fetch`. Game and market data comes from public HTTP APIs rather than bundled data packages.
 
 ## Directory Structure
 
 ```
 warframe-mcp/
+├── wrangler.jsonc                # Cloudflare Worker configuration
+├── tsconfig.worker.json          # Worker TypeScript configuration
+├── vitest.config.ts              # Workers runtime test configuration
 ├── package.json
 ├── tsconfig.json
+├── worker/
+│   ├── index.ts                  # Stateless /mcp + /healthz + MCP tool registration
+│   ├── openai-compat.ts          # Stable IDs and OpenAI search/fetch result mapping
+│   └── warframe-market.ts        # Worker-safe API v2 client, reliability, cache, and search
+├── test/
+│   ├── server.test.mjs           # Legacy stdio MCP regression test
+│   ├── warframe-market.test.ts   # Worker client limiter, retry, cache, and deduplication tests
+│   ├── worker.test.ts            # Worker health and MCP tests
+│   └── tsconfig.json
 ├── src/
-│   ├── index.ts                   # Server init + transport + tool registration
+│   ├── index.ts                   # Legacy Node stdio/HTTP entrypoint
 │   ├── api/
 │   │   ├── warframestat.ts        # HTTP client for api.warframestat.us
 │   │   ├── warframe-market.ts     # HTTP client for api.warframe.market/v2
-│   │   └── profile.ts             # Thin wrapper for player profile calls
+│   │   ├── overframe.ts           # Overframe.gg client
+│   │   └── wiki.ts                # Warframe Wiki client
 │   ├── tools/
 │   │   ├── worldstate.ts          # world_state, baro_kiteer, active_fissures
 │   │   ├── items.ts               # lookup_warframe, lookup_weapon, lookup_mod, lookup_item
@@ -31,14 +44,19 @@ warframe-mcp/
 │   │   ├── primeVault.ts          # prime_vault_status
 │   │   ├── simaris.ts             # simaris_target
 │   │   ├── enemy.ts               # find_enemy_spawn
-│   │   └── profile.ts             # player_profile, player_mastery_items, player_stats, player_syndicates, player_loadout
+│   │   ├── builds.ts              # lookup_builds
+│   │   ├── crafting.ts            # crafting_requirements, crafting_usage
+│   │   ├── farmOptimizer.ts       # farm_route_optimizer
+│   │   ├── synergy.ts             # task_synergy_planner
+│   │   └── colors.ts              # color_palette_finder
 │   ├── utils/
 │   │   ├── cache.ts               # TTLCache<T> — Map-based in-memory TTL cache
-│   │   └── formatting.ts          # Pure text formatting helpers
+│   │   ├── formatting.ts          # Pure text formatting helpers
+│   │   └── lua-parser.ts          # Wiki Lua data parser
 │   └── types/
 │       ├── warframestat.ts        # Types for api.warframestat.us responses
 │       ├── warframe-market.ts     # Types for api.warframe.market/v2 responses
-│       ├── profile.ts             # Types for player profile + xpToRank utility
+│       ├── overframe.ts           # Types for Overframe responses
 │       └── index.ts               # Re-export barrel
 └── dist/                          # Compiled output (gitignored)
 ```
@@ -49,11 +67,12 @@ warframe-mcp/
 |-----------|-----|
 | Worldstate (fissures, sortie, etc.) | 60s |
 | Drop tables | 5 min |
-| Market items list (`/v2/items`) | 24h |
+| Worker market items list (`/v2/items`) | 6h |
+| Worker market top orders (`/v2/orders/item/{slug}/top`) | 20s |
 | Static item/weapon/mod data | 24h |
 | Player profile | 5 min |
 
-## Tool Summary
+## Legacy Node Tool Summary
 
 | File | Tools | Count |
 |------|-------|-------|
@@ -64,18 +83,29 @@ warframe-mcp/
 | `primeVault.ts` | `prime_vault_status` | 1 |
 | `simaris.ts` | `simaris_target` | 1 |
 | `enemy.ts` | `find_enemy_spawn` | 1 |
-| `profile.ts` | `player_profile`, `player_mastery_items`, `player_stats`, `player_syndicates`, `player_loadout` | 5 |
-| **Total** | | **18** |
+| `builds.ts` | `lookup_builds` | 1 |
+| `crafting.ts` | `crafting_requirements`, `crafting_usage` | 2 |
+| `farmOptimizer.ts` | `farm_route_optimizer` | 1 |
+| `synergy.ts` | `task_synergy_planner` | 1 |
+| `colors.ts` | `color_palette_finder` | 1 |
+| **Total** | | **19** |
+
+The production Worker publishes only `wfm_search_items`, `wfm_get_top_orders`, `search`, and `fetch`.
 
 ## Design Decisions
 
 | Decision | Reason |
 |----------|--------|
+| Stateless `createMcpHandler()` | The pilot tools keep no per-client state, so the Worker needs no Durable Objects, KV, D1, or in-memory session map |
+| New `McpServer` per Worker request | MCP SDK 1.26+ prohibits reconnecting a server instance and per-request instances prevent cross-client response leakage |
 | No npm data packages | warframestat.us is backed by the same packages server-side; HTTP keeps install <5MB and data always fresh |
-| In-memory TTL cache only | Server is a short-lived stdio process; no Redis needed |
+| Separate Worker market client | The Worker imports no legacy Node client or transport; reliability uses only Worker Web APIs |
+| Shared isolate request coordination | One sliding-window limiter allows at most three external request starts per second; identical in-flight requests share one promise |
+| Worker market caches | `/v2/items` responses are cached for 6h and top orders for 20s; endpoint and all market filters are part of the key |
+| Stable OpenAI document IDs | `search` returns `wfm:item:<slug>` and `fetch` accepts only that item ID type |
 | warframe.market v2 only | v1 returns 403; `warframe-nexus-query` targets v1 — do not use |
 | warframestat.us profile proxy | Preferred over raw DE endpoint — normalizes inconsistent response structure |
 | Default platform: `pc` | All worldstate endpoints are platform-scoped; `platform` param is optional |
-| `"module": "Node16"` | All internal imports MUST use `.js` extensions |
-| `NEVER console.log` | stdout is the JSON-RPC channel; use `console.error` only |
+| `"module": "Node16"` for legacy Node code | All internal imports MUST use `.js` extensions |
+| `NEVER console.log` in stdio code | stdout is the JSON-RPC channel; use `console.error` only |
 | `Accept-Language: en` on every request | Without it, some warframestat.us endpoints return localized strings (Chinese observed on archon hunt) |

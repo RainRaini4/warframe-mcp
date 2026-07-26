@@ -218,7 +218,23 @@ URL patterns:
 
 ---
 
-## `src/api/warframe-market.ts`
+## `worker/warframe-market.ts`
+
+The production Worker uses a separate fetch-only client with no Node imports. It implements only:
+
+- `GET /v2/items`, cached in the Worker isolate for six hours;
+- `GET /v2/orders/item/{slug}/top`, cached for 20 seconds;
+- an 8-second `AbortController` timeout;
+- one shared sliding-window limiter with at most three external request starts per second;
+- retry for `429`, `509`, temporary `5xx`, and network errors, honoring `Retry-After` before bounded exponential backoff with jitter;
+- endpoint/filter-aware cache keys and in-flight promise deduplication;
+- specialized safe validation, HTTP, timeout, rate-limit, and availability errors.
+
+Every request sends `Accept`, `User-Agent`, `Language`, `Platform`, and `Crossplay`. `400`, `403`, `404`, validation failures, and timeouts are not retried. Rejected in-flight promises are removed so later calls can recover. There is intentionally no authorization, filesystem access, persistent storage, or order mutation method.
+
+Search normalization uses Unicode NFKD, lowercasing, `ё`→`е`, removal of combining marks and punctuation, separator normalization, and whitespace collapse. Matches are limited to exact or substring comparison.
+
+## `src/api/warframe-market.ts` (legacy Node)
 
 ```typescript
 import { TTLCache, TTL } from "../utils/cache.js";

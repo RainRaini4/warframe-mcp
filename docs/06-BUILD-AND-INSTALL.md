@@ -2,7 +2,7 @@
 
 ## Requirements
 
-- Node.js >= 18.0.0 (native `fetch`, top-level `await`)
+- Node.js >= 20.3.0 (required by Wrangler; also provides native `fetch` and top-level `await`)
 - npm >= 9.0.0
 
 ## `package.json`
@@ -16,19 +16,33 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.worker.json && tsc --noEmit -p test/tsconfig.json",
+    "test": "npm run build && node --test test/server.test.mjs && vitest run",
+    "check": "npm run typecheck && npm test && npm run deploy:dry",
     "start": "node dist/index.js",
-    "dev": "tsc --watch"
+    "start:http": "node dist/index.js --http",
+    "dev": "wrangler dev",
+    "dev:stdio": "tsc --watch",
+    "deploy": "wrangler deploy",
+    "deploy:dry": "wrangler deploy --dry-run"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.1",
-    "zod": "^3.25.1"
+    "@modelcontextprotocol/sdk": "1.26.0",
+    "agents": "0.8.0",
+    "express": "^5.2.1",
+    "zod": "4.4.3"
   },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "0.15.0",
+    "@cloudflare/workers-types": "4.20260702.1",
+    "@types/express": "^5.0.6",
     "@types/node": "^22.15.0",
-    "typescript": "^5.8.3"
+    "typescript": "^5.8.3",
+    "vitest": "4.1.10",
+    "wrangler": "4.85.0"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.3.0"
   }
 }
 ```
@@ -78,9 +92,14 @@ dist/
 ## Build
 
 ```bash
-npm install        # ~5MB total, no heavy data packages
-npm run build      # tsc — zero output = success
-node dist/index.js # Hangs on stdin — correct. Ctrl+C to stop.
+npm install         # Install dependencies
+npm run typecheck   # Type-check without emitting dist
+npm test            # Build and run automated tests
+npm run build       # Compile to dist
+npm run deploy:dry  # Build the Worker bundle without uploading
+npm run deploy      # Publish with an authenticated Wrangler session
+npm run dev         # Serve /healthz and /mcp through Wrangler
+node dist/index.js  # Hangs on stdin — correct. Ctrl+C to stop.
 ```
 
 Smoke test:
@@ -89,7 +108,7 @@ Smoke test:
 echo '{"jsonrpc":"2.0","method":"tools/list","id":1}' | node dist/index.js
 ```
 
-Expect: JSON with all 18 tools listed.
+Expect: JSON with all 19 tools listed.
 
 Full tool call test:
 
@@ -107,6 +126,15 @@ Expect: two JSON responses — initialize, then baro_kiteer result.
 warframe-mcp/
 ├── package.json
 ├── tsconfig.json
+├── tsconfig.worker.json
+├── vitest.config.ts
+├── wrangler.jsonc
+├── worker/
+│   └── index.ts
+├── test/
+│   ├── server.test.mjs
+│   ├── worker.test.ts
+│   └── tsconfig.json
 ├── src/
 │   ├── index.ts
 │   ├── api/
@@ -137,6 +165,36 @@ warframe-mcp/
 
 ## MCP Client Configuration
 
+### Cloudflare Worker
+
+Run `npm run dev`, then use the public Streamable HTTP endpoint:
+
+```text
+http://127.0.0.1:8787/mcp
+```
+
+Health checks use `GET http://127.0.0.1:8787/healthz`. The MCP handler is stateless and stores no session data.
+
+The Worker exposes:
+
+- `wfm_search_items` — Russian/English/slug item lookup;
+- `wfm_get_top_orders` — current top sell and buy orders;
+- `search` — up to ten citable items with stable `wfm:item:<slug>` IDs;
+- `fetch` — a current market document for an ID returned by `search`.
+
+All tools use `language=ru`, `platform=pc`, and `crossplay=true` by default. They need no credentials or environment variables. For OpenAI-compatible clients, call `search({"query":"Титания Прайм"})` and pass a returned ID to `fetch`.
+
+Production deployment requires an authenticated Wrangler session:
+
+```bash
+npx wrangler login
+npx wrangler whoami
+npm run deploy:dry
+npm run deploy
+```
+
+Without an authenticated account, stop after the dry run and use `https://warframe-mcp.<YOUR_WORKERS_SUBDOMAIN>.workers.dev/mcp` as the documented URL template. The Worker configuration has no Durable Objects, KV, D1, service bindings, or secrets. `nodejs_compat` is required by transitive imports in the official Cloudflare `agents` package even though the Worker source itself uses no Node-only APIs.
+
 ### Claude Desktop
 
 **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
@@ -153,7 +211,7 @@ warframe-mcp/
 }
 ```
 
-Restart Claude Desktop after saving. 18 Warframe tools will appear.
+Restart Claude Desktop after saving. 19 Warframe tools will appear.
 
 ### OpenCode
 
@@ -208,6 +266,7 @@ console.error("[DEBUG] fetchVoidTrader:", JSON.stringify(data, null, 2));
 
 ## Notes
 
-- Server is a **local subprocess** — not a web service. No HTTP server, no auth, no persistent storage.
-- Works offline for cached data. Requires internet for live API calls.
+- The production target is the stateless Cloudflare Worker at `/mcp`; it has no auth, Durable Objects, KV, D1, or persistent storage.
+- The legacy Node entrypoint remains available as a local stdio subprocess or Express HTTP server.
+- Item search reuses the in-isolate six-hour catalog cache, while top orders use a 20-second cache. Cold or expired requests require Warframe Market API access.
 - No environment variables required.
